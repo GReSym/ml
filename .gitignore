@@ -10,3 +10,6 @@ wheels/
 .venv
 milvus/volumes
 Qwen3-Embedding/*
+
+# Local config with secrets (see config.example.json)
+config.json

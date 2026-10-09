@@ -1,0 +1,40 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 3306,
+    "database": "GamesRecommend",
+    "user": "xxx",
+    "password": "xxx"
+  },
+  "milvus": {
+    "uri": "http://localhost:19530",
+    "token": "",
+    "collection": "games_qwen3_06b_v1"
+  },
+  "rabbitmq": {
+    "host": "localhost",
+    "port": 5672,
+    "virtual_host": "/",
+    "user": "xxx",
+    "password": "xxx",
+    "exchange": "gresym.tasks",
+    "dead_letter_exchange": "gresym.dlx",
+    "queue": "ml.vectorize-game",
+    "dead_letter_queue": "ml.vectorize-game.dlq",
+    "routing_key": "game.vectorize",
+    "delivery_limit": 5,
+    "prefetch": 4
+  },
+  "model": {
+    "name": "Qwen/Qwen3-Embedding-0.6B",
+    "path": "Qwen3-Embedding",
+    "dimension": 1024,
+    "max_seq_length": 1024,
+    "batch_size": 1,
+    "threads": null
+  },
+  "api": {
+    "host": "127.0.0.1",
+    "port": 8000
+  }
+}
