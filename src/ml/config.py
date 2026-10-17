@@ -11,7 +11,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 ML_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_FILE = ML_ROOT / "config.example.json"
@@ -63,6 +63,22 @@ class ModelSettings(BaseModel):
         return path if path.is_absolute() else ML_ROOT / path
 
 
+class ReviewSettings(BaseModel):
+    max_selected: int = Field(ge=1, le=64)  # reviews embedded per game (also the Milvus array capacity limit)
+    min_chars: int  # shorter reviews ("10/10", "best game") say nothing about the game
+    max_chars: int  # each review is cut to this many characters
+    weight_max: float = Field(ge=0)  # α for a game with max_selected reviews
+
+
+class StalenessSettings(BaseModel):
+    min_overlap: float  # Jaccard of stored vs. current review selection below this → reviews changed
+    min_selected: int  # ...but only if either selection has at least this many reviews
+    sentiment_shift: float  # |Δ positive share| on Steam at least this → sentiment shift
+    sentiment_min_total: int  # ...only for games with at least this many Steam reviews
+    growth_min_new: int  # Steam review count grew by at least this many
+    growth_ratio: float  # ...and by at least this share of the old count
+
+
 class ApiSettings(BaseModel):
     host: str
     port: int
@@ -73,6 +89,8 @@ class Settings(BaseModel):
     milvus: MilvusSettings
     rabbitmq: RabbitMqSettings
     model: ModelSettings
+    reviews: ReviewSettings
+    staleness: StalenessSettings
     api: ApiSettings
 
 

@@ -12,6 +12,8 @@ from pydantic.alias_generators import to_camel
 
 from ml import recommend as rec
 from ml.config import get_settings
+from ml.db import GameRepository
+from ml.staleness import Reason, filter_items, find_stale
 from ml.vectors import GameVectorStore
 
 
@@ -42,6 +44,24 @@ class RecommendationsResponse(CamelModel):
 
 class SimilarResponse(CamelModel):
     items: list[ScoredGameDto]
+
+
+class StaleGameDto(CamelModel):
+    game_id: int
+    score: float
+    reasons: list[Reason]
+    vectorized_at: int | None  # unix seconds
+    details: dict[str, float | int | None]
+
+
+class StaleGamesResponse(CamelModel):
+    collection: str
+    text_version: int
+    vectors: int
+    games: int
+    counts: dict[Reason, int]  # over all stale games, before filtering
+    total: int  # matching the filter
+    items: list[StaleGameDto]
 
 
 class HealthResponse(CamelModel):
@@ -91,3 +111,31 @@ def similar_games(game_id: int, limit: int = Query(default=10, ge=1, le=100)) ->
     if items is None:
         raise HTTPException(status_code=404, detail=f"Game {game_id} has no vector")
     return SimilarResponse(items=_scored(items))
+
+
+@app.get("/vectorization/stale", response_model=StaleGamesResponse, response_model_by_alias=True)
+def stale_games(
+    reason: list[Reason] | None = Query(default=None, description="only games with any of these reasons"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> StaleGamesResponse:
+    """Games whose vector is out of date, best candidates first. Takes a few seconds (scans all games)."""
+    games = GameRepository(get_settings().database)  # not thread-safe, so one per request
+    try:
+        report = find_stale(get_settings(), _store(), games)
+    finally:
+        games.close()
+    items = filter_items(report.items, reason)
+    return StaleGamesResponse(
+        collection=report.collection,
+        text_version=report.text_version,
+        vectors=report.vectors,
+        games=report.games,
+        counts=report.counts(),
+        total=len(items),
+        items=[
+            StaleGameDto(game_id=i.game_id, score=round(i.score, 3), reasons=i.reasons,
+                         vectorized_at=i.vectorized_at, details=i.details)
+            for i in items[offset : offset + limit]
+        ],
+    )

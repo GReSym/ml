@@ -9,7 +9,7 @@
   "milvus": {
     "uri": "http://localhost:19530",
     "token": "",
-    "collection": "games_qwen3_06b_v1"
+    "collection": "games_qwen3_06b_v2"
   },
   "rabbitmq": {
     "host": "localhost",
@@ -32,6 +32,20 @@
     "max_seq_length": 1024,
     "batch_size": 1,
     "threads": null
+  },
+  "reviews": {
+    "max_selected": 8,
+    "min_chars": 150,
+    "max_chars": 600,
+    "weight_max": 0.35
+  },
+  "staleness": {
+    "min_overlap": 0.6,
+    "min_selected": 3,
+    "sentiment_shift": 0.15,
+    "sentiment_min_total": 50,
+    "growth_min_new": 100,
+    "growth_ratio": 0.2
   },
   "api": {
     "host": "127.0.0.1",

@@ -23,6 +23,14 @@ def main() -> None:
     vectorize.add_argument("--skip-existing", action="store_true",
                            help="skip games that already have a vector with the current text version")
 
+    stale = commands.add_parser("stale", help="list games whose vector is out of date (nothing is vectorized)")
+    stale.add_argument("--limit", type=int, default=30, help="rows to print (default 30)")
+    stale.add_argument("--reason", action="append",
+                       help="only these reasons (repeatable): description, sentiment, reviews, growth, "
+                            "outdated, missing, deleted")
+    stale.add_argument("--ids-only", action="store_true",
+                       help="print only comma-separated ids (for `ml vectorize --ids`)")
+
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -50,3 +58,7 @@ def main() -> None:
             from ml.vectorize import run_bulk
 
             run_bulk(settings, ids=args.ids, limit=None if args.all else args.limit, skip_existing=args.skip_existing)
+        case "stale":
+            from ml.staleness import print_report
+
+            print_report(settings, limit=args.limit, reasons=args.reason, ids_only=args.ids_only)
