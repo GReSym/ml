@@ -11,7 +11,7 @@ import json
 import os
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -59,6 +59,8 @@ class ModelSettings(BaseModel):
     max_seq_length: int
     batch_size: int
     threads: int | None = None
+    device: str = "cpu"  # "cpu", "cuda" (also ROCm: torch exposes AMD GPUs as cuda) or "auto"
+    dtype: Literal["float32", "float16", "bfloat16"] = "float32"  # fp32 on CPU: bf16 is ~4x slower there
 
     @property
     def resolved_path(self) -> Path:

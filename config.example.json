@@ -31,7 +31,9 @@
     "dimension": 1024,
     "max_seq_length": 1024,
     "batch_size": 1,
-    "threads": null
+    "threads": null,
+    "device": "cpu",
+    "dtype": "float32"
   },
   "reviews": {
     "max_selected": 8,

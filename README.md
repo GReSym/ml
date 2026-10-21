@@ -104,6 +104,16 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 - около 4 ГБ свободной оперативной памяти для модели.
 
 PyTorch устанавливается в CPU-версии (индекс `pytorch-cpu` в `pyproject.toml`), видеокарта не нужна.
+GPU (AMD ROCm или NVIDIA CUDA) включается в Docker настройкой `TORCH_BACKEND` в `../deploy` (см. README организации).
+Без Docker нужно заменить torch вручную и запускать через `uv run --no-sync`:
+
+```bash
+uv sync
+uv pip uninstall torch
+uv pip install --prerelease allow --index https://download.pytorch.org/whl/nightly/rocm10.1 torch   # или .../nightly/cu134
+# в config.json: "model": {"device": "cuda", "dtype": "bfloat16"}  (для ROCm тоже cuda)
+uv run --no-sync ml worker
+```
 
 ## Установка
 
@@ -175,6 +185,8 @@ Exchange и очереди RabbitMQ создаются автоматическ�
 | `model.max_seq_length` | `1024` | Максимальная длина текста в токенах (длинные тексты обрезаются) |
 | `model.batch_size` | `1` | Размер батча (на CPU 1 оказался быстрее 8) |
 | `model.threads` | `null` | Число потоков PyTorch (`null` — по умолчанию) |
+| `model.device` | `cpu` | `cpu`, `cuda` (NVIDIA и AMD ROCm) или `auto` |
+| `model.dtype` | `float32` | `float32` для CPU, `bfloat16`/`float16` для GPU |
 | `reviews.max_selected` | `8` | Сколько отзывов учитывается в векторе игры |
 | `reviews.min_chars`, `reviews.max_chars` | `150`, `600` | Минимальная длина отзыва и длина, до которой он обрезается |
 | `reviews.weight_max` | `0.35` | Вес отзывов при `max_selected` отзывах |
