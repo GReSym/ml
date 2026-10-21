@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 
 def _parse_ids(value: str) -> list[int]:
@@ -30,6 +31,15 @@ def main() -> None:
                             "outdated, missing, deleted")
     stale.add_argument("--ids-only", action="store_true",
                        help="print only comma-separated ids (for `ml vectorize --ids`)")
+
+    export = commands.add_parser("export", help="back up the game vectors from Milvus into an .npz file")
+    export.add_argument("--out", type=Path, help="target file (default milvus-<collection>-<date>.npz)")
+    export.add_argument("--collection", help="collection to export (default milvus.collection)")
+
+    restore = commands.add_parser("import", help="restore game vectors from an `ml export` file into Milvus")
+    restore.add_argument("file", type=Path)
+    restore.add_argument("--collection", help="target collection (default milvus.collection), created if missing")
+    restore.add_argument("--yes", action="store_true", help="import into a collection that already has vectors")
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -62,3 +72,13 @@ def main() -> None:
             from ml.staleness import print_report
 
             print_report(settings, limit=args.limit, reasons=args.reason, ids_only=args.ids_only)
+        case "export" | "import":
+            from ml.backup import BackupError, export_vectors, import_vectors
+
+            try:
+                if args.command == "export":
+                    export_vectors(settings, args.out, args.collection)
+                else:
+                    import_vectors(settings, args.file, args.collection, overwrite=args.yes)
+            except BackupError as e:
+                sys.exit(f"Error: {e}")

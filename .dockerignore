@@ -1,0 +1,7 @@
+.venv/
+.git/
+**/__pycache__/
+Qwen3-Embedding/
+milvus/
+config.json
+*.npz

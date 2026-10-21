@@ -143,6 +143,26 @@ class GameVectorStore:
         ]
         self._client.upsert(self._collection, data=rows)
 
+    def exists(self) -> bool:
+        return self._client.has_collection(self._collection)
+
+    def raw_rows(self, fields: list[str], batch_size: int = 500) -> Iterator[list[dict]]:
+        """Every row as stored, in batches (used by ml.backup)."""
+        self._client.load_collection(self._collection)
+        iterator = self._client.query_iterator(
+            self._collection, batch_size=batch_size, filter="", output_fields=fields, consistency_level="Strong",
+        )
+        try:
+            while rows := iterator.next():
+                yield rows
+        finally:
+            iterator.close()
+
+    def upsert_rows(self, rows: list[dict]) -> None:
+        """Rows exactly as given (ml.backup restore keeps updated_at and the snapshot fields)."""
+        if rows:
+            self._client.upsert(self._collection, data=rows)
+
     def delete(self, ids: list[int]) -> None:
         if ids:
             self._client.delete(self._collection, ids=ids)

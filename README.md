@@ -76,6 +76,7 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 ├── src/ml/
 │   ├── __init__.py          # CLI: ml api | worker | vectorize | stale
 │   ├── config.py            # Загрузка конфигурации
+│   ├── backup.py            # Резервная копия векторов (ml export / ml import)
 │   ├── db.py                # Чтение игр и отзывов из MariaDB
 │   ├── text.py              # Очистка HTML, шаблон текста игры, хэш текста
 │   ├── reviews.py           # Очистка и отбор отзывов, вес отзывов
@@ -86,11 +87,10 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 │   ├── recommend.py         # Алгоритм рекомендаций
 │   ├── api.py               # HTTP API (FastAPI)
 │   └── worker.py            # Обработчик очереди RabbitMQ
-├── milvus/
-│   └── standalone_embed.sh  # Запуск Milvus standalone в Docker
 ├── Qwen3-Embedding/         # Файлы модели (не в git, скачиваются отдельно)
 ├── config.example.json      # Пример конфигурации (в git)
 ├── config.json              # Локальная конфигурация с секретами (не в git)
+├── Dockerfile               # Образ для `ml api` и `ml worker` (собирается из ../deploy)
 ├── pyproject.toml
 └── uv.lock
 ```
@@ -100,8 +100,7 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 - Linux;
 - [uv](https://docs.astral.sh/uv/) 0.12+ (Python 3.14 uv установит сам);
 - MariaDB с базой данных GReSym (заполняется backend и парсером);
-- Milvus 3.0 (Docker);
-- RabbitMQ 4.x (нужен только для `worker`);
+- Milvus 3.0 и RabbitMQ 4.x (Docker Compose из `../deploy`, RabbitMQ нужен только для `worker`);
 - около 4 ГБ свободной оперативной памяти для модели.
 
 PyTorch устанавливается в CPU-версии (индекс `pytorch-cpu` в `pyproject.toml`), видеокарта не нужна.
@@ -128,30 +127,23 @@ uv run hf download Qwen/Qwen3-Embedding-0.6B --local-dir Qwen3-Embedding
 git clone https://huggingface.co/Qwen/Qwen3-Embedding-0.6B Qwen3-Embedding
 ```
 
-### 3. Milvus
+### 3. Milvus и RabbitMQ
+
+Milvus 3.0.2, RabbitMQ 4.2 и MariaDB запускаются через Docker Compose из `../deploy`:
 
 ```bash
-cd milvus
-./standalone_embed.sh start      # также: stop, restart, upgrade, delete
+../deploy/manage.sh up
 ```
 
-Скрипт использует `sudo docker`. Milvus доступен на `localhost:19530`, проверка состояния:
+Milvus доступен на `localhost:19530`, RabbitMQ на `localhost:5672`. Проверка состояния Milvus:
 
 ```bash
 curl localhost:9091/healthz
 ```
 
-### 4. RabbitMQ
+Exchange и очереди RabbitMQ создаются автоматически при запуске worker или при первой публикации из backend.
 
-RabbitMQ должен быть запущен на `localhost:5672`:
-
-```bash
-sudo systemctl start rabbitmq-server
-```
-
-Exchange и очереди создаются автоматически при запуске worker или при первой публикации из backend.
-
-### 5. Конфигурация
+### 4. Конфигурация
 
 Настройки читаются из `config.example.json` (в git), поверх которого накладывается `config.json` (не в git).
 Поэтому в `config.json` достаточно указать только секреты:
@@ -166,6 +158,8 @@ Exchange и очереди создаются автоматически при 
 Для ML-сервиса достаточно пользователя MariaDB с правами только на чтение (`SELECT`).
 Незаполненные значения (`""`, `xxx`, `###`) приводят к ошибке при запуске с указанием, что нужно заполнить.
 Путь к конфигурации можно переопределить переменной окружения `GRESYM_ML_CONFIG`.
+Отдельные значения переопределяются переменными `GRESYM_ML__<РАЗДЕЛ>__<КЛЮЧ>` (например, `GRESYM_ML__DATABASE__HOST=mariadb`).
+Так настраиваются Docker-контейнеры. Если секреты заданы переменными, `config.json` не обязателен.
 
 Основные параметры `config.example.json`:
 
@@ -215,6 +209,22 @@ uv run ml stale                                   # список игр, кот�
 uv run ml stale --reason description --limit 50   # только с изменённым описанием
 uv run ml vectorize --ids $(uv run ml stale --ids-only --reason reviews)
 ```
+
+### Резервная копия векторов
+
+```bash
+uv run ml export                         # вся коллекция → milvus-<коллекция>-<дата>.npz (модель не нужна)
+uv run ml export --out backup.npz
+uv run ml import backup.npz              # создаёт коллекцию и загружает векторы
+uv run ml import backup.npz --collection test --yes   # в другую коллекцию / в непустую коллекцию
+```
+
+Файл содержит все поля, включая векторы, и не зависит от версии Milvus. Импорт проверяет модель и размерность.
+
+### Docker
+
+Docker Compose для всего проекта находится в `../deploy` (MariaDB, RabbitMQ, Milvus, а в профиле `app` ещё API, `ml api` и `ml worker`).
+Образ собирается из `Dockerfile` в этом репозитории. Модель в образ не входит: каталог `Qwen3-Embedding/` монтируется только для чтения.
 
 ### Worker (очередь векторизации)
 

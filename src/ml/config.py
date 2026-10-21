@@ -3,6 +3,8 @@
 config.example.json (in git) is the source of truth for structure and non-secret defaults.
 config.json (git-ignored) is merged on top of it, so it only needs the secrets (DB and RabbitMQ credentials).
 GRESYM_ML_CONFIG can point to another config.json.
+Environment variables GRESYM_ML__<SECTION>__<KEY> (e.g. GRESYM_ML__DATABASE__HOST) are merged last. They're how
+the Docker containers are configured; config.json is optional when they provide the secrets.
 """
 
 import json
@@ -18,6 +20,7 @@ EXAMPLE_FILE = ML_ROOT / "config.example.json"
 CONFIG_FILE = ML_ROOT / "config.json"
 
 PLACEHOLDERS = {"", "xxx", "###"}
+ENV_PREFIX = "GRESYM_ML__"
 
 
 class DatabaseSettings(BaseModel):
@@ -115,6 +118,22 @@ def _read_json(path: Path) -> dict[str, Any]:
         raise ConfigError(f"{path} is not valid JSON: {e}") from e
 
 
+def _env_overrides() -> dict[str, Any]:
+    """GRESYM_ML__RABBITMQ__HOST=x → {"rabbitmq": {"host": "x"}}. Values stay strings, pydantic converts them."""
+    result: dict[str, Any] = {}
+    for name, value in os.environ.items():
+        if not name.startswith(ENV_PREFIX):
+            continue
+        path = [part.lower() for part in name.removeprefix(ENV_PREFIX).split("__") if part]
+        if not path:
+            continue
+        node = result
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = value
+    return result
+
+
 def _check_secrets(settings: Settings, config_path: Path) -> None:
     missing = [
         name
@@ -127,19 +146,23 @@ def _check_secrets(settings: Settings, config_path: Path) -> None:
         if value in PLACEHOLDERS
     ]
     if missing:
-        raise ConfigError(f"Fill in {', '.join(missing)} in {config_path}")
+        raise ConfigError(f"Fill in {', '.join(missing)} in {config_path} (or {ENV_PREFIX}* environment variables)")
 
 
 @cache
 def get_settings() -> Settings:
     config_path = Path(os.environ.get("GRESYM_ML_CONFIG", CONFIG_FILE))
-    if not config_path.exists():
+    env = _env_overrides()
+    if not config_path.exists() and not env:
         raise ConfigError(
             f"{config_path} not found. Create it with the secrets from {EXAMPLE_FILE.name} "
             "(only the values that differ are needed)"
         )
 
-    data = _merge(_read_json(EXAMPLE_FILE), _read_json(config_path))
+    data = _read_json(EXAMPLE_FILE)
+    if config_path.exists():
+        data = _merge(data, _read_json(config_path))
+    data = _merge(data, env)
     settings = Settings.model_validate(data)
     _check_secrets(settings, config_path)
     return settings
