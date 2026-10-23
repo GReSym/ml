@@ -1,5 +1,5 @@
 # ML service image: one image for `ml api` and `ml worker`. Built by ../deploy/compose.yaml (profile "app").
-# The model isn't baked in: compose mounts ml/Qwen3-Embedding at /models/Qwen3-Embedding (read-only).
+# The model isn't baked in: compose mounts ml/Qwen3-Embedding and ml/Qwen3-Embedding-onnx under /models (read-only).
 # Configuration: config.example.json + GRESYM_ML__<SECTION>__<KEY> environment variables (see src/ml/config.py).
 
 FROM python:3.14-slim

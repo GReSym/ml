@@ -8,7 +8,7 @@ import numpy as np
 
 from ml.config import ReviewSettings, Settings
 from ml.db import GameRepository, GameText, ReviewRow
-from ml.embedder import Embedder
+from ml.embedder import create_embedder
 from ml.reviews import SelectedReview, positive_share, reviews_weight, select_reviews
 from ml.text import TEXT_VERSION, build_game_text, text_hash
 from ml.vectors import GameVector, GameVectorStore
@@ -64,7 +64,7 @@ class Vectorizer:
         self.games = GameRepository(settings.database)
         self.store = GameVectorStore(settings.milvus, settings.model)
         self.store.ensure_collection()
-        self._embedder = Embedder(settings.model)
+        self._embedder = create_embedder(settings.model)
 
     def vectorize(self, ids: list[int]) -> VectorizeResult:
         """Idempotent: re-vectorizing a game overwrites its vector. Games missing in MariaDB are removed from Milvus."""

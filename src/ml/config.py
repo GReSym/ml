@@ -54,17 +54,20 @@ class RabbitMqSettings(BaseModel):
 
 class ModelSettings(BaseModel):
     name: str
-    path: str
+    backend: Literal["onnx", "torch"] = "onnx"  # onnx: FastEmbed, CPU only, ~1.55x faster; torch: Sentence Transformers (GPU)
+    path: str  # torch checkpoint
+    onnx_path: str  # ONNX export (onnx/model.onnx + tokenizer files)
     dimension: int
     max_seq_length: int
     batch_size: int
     threads: int | None = None
-    device: str = "cpu"  # "cpu", "cuda" (also ROCm: torch exposes AMD GPUs as cuda) or "auto"
-    dtype: Literal["float32", "float16", "bfloat16"] = "float32"  # fp32 on CPU: bf16 is ~4x slower there
+    device: str = "cpu"  # "cpu", "cuda" (also ROCm: torch exposes AMD GPUs as cuda) or "auto". onnx: cpu only
+    dtype: Literal["float32", "float16", "bfloat16"] = "float32"  # torch only. fp32 on CPU: bf16 is ~4x slower there
 
     @property
     def resolved_path(self) -> Path:
-        path = Path(self.path)
+        """Model directory of the selected backend."""
+        path = Path(self.onnx_path if self.backend == "onnx" else self.path)
         return path if path.is_absolute() else ML_ROOT / path
 
 

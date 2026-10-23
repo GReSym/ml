@@ -80,14 +80,15 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 │   ├── db.py                # Чтение игр и отзывов из MariaDB
 │   ├── text.py              # Очистка HTML, шаблон текста игры, хэш текста
 │   ├── reviews.py           # Очистка и отбор отзывов, вес отзывов
-│   ├── embedder.py          # Модель эмбеддингов (Sentence Transformers)
+│   ├── embedder.py          # Модель эмбеддингов (ONNX Runtime через FastEmbed или Sentence Transformers)
 │   ├── vectors.py           # Коллекция Milvus: запись и поиск
 │   ├── vectorize.py         # Векторизация игр (в том числе массовая)
 │   ├── staleness.py         # Поиск устаревших векторов
 │   ├── recommend.py         # Алгоритм рекомендаций
 │   ├── api.py               # HTTP API (FastAPI)
 │   └── worker.py            # Обработчик очереди RabbitMQ
-├── Qwen3-Embedding/         # Файлы модели (не в git, скачиваются отдельно)
+├── Qwen3-Embedding/         # Файлы модели для torch (не в git, скачиваются отдельно)
+├── Qwen3-Embedding-onnx/    # ONNX-версия модели, используется по умолчанию (не в git)
 ├── config.example.json      # Пример конфигурации (в git)
 ├── config.json              # Локальная конфигурация с секретами (не в git)
 ├── Dockerfile               # Образ для `ml api` и `ml worker` (собирается из ../deploy)
@@ -125,7 +126,13 @@ uv sync
 
 ### 2. Модель
 
-Модель нужно скачать в каталог `Qwen3-Embedding/` (он указан в `.gitignore`):
+По умолчанию (`model.backend: onnx`) модель работает через ONNX Runtime на CPU. Её нужно скачать в каталог `Qwen3-Embedding-onnx/`:
+
+```bash
+uv run hf download Qdrant/Qwen3-Embedding-0.6B-onnx --include "onnx/model.onnx*" --include "*.json" --local-dir Qwen3-Embedding-onnx
+```
+
+Для работы на GPU (`model.backend: torch`) нужна исходная модель в каталоге `Qwen3-Embedding/`:
 
 ```bash
 uv run hf download Qwen/Qwen3-Embedding-0.6B --local-dir Qwen3-Embedding
@@ -236,7 +243,7 @@ uv run ml import backup.npz --collection test --yes   # в другую колл
 ### Docker
 
 Docker Compose для всего проекта находится в `../deploy` (MariaDB, RabbitMQ, Milvus, а в профиле `app` ещё API, `ml api` и `ml worker`).
-Образ собирается из `Dockerfile` в этом репозитории. Модель в образ не входит: каталог `Qwen3-Embedding/` монтируется только для чтения.
+Образ собирается из `Dockerfile` в этом репозитории. Модель в образ не входит: каталоги `Qwen3-Embedding/` и `Qwen3-Embedding-onnx/` монтируются только для чтения.
 
 ### Worker (очередь векторизации)
 

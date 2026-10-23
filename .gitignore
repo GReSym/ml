@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 Qwen3-Embedding/*
+Qwen3-Embedding-onnx/
 
 # Local config with secrets (see config.example.json)
 config.json

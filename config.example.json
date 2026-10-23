@@ -27,7 +27,9 @@
   },
   "model": {
     "name": "Qwen/Qwen3-Embedding-0.6B",
+    "backend": "onnx",
     "path": "Qwen3-Embedding",
+    "onnx_path": "Qwen3-Embedding-onnx",
     "dimension": 1024,
     "max_seq_length": 1024,
     "batch_size": 1,

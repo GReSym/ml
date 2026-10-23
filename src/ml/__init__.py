@@ -44,7 +44,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    # Imports are deferred: torch/sentence-transformers take seconds to import and the API doesn't need them
+    # Imports are deferred: the embedding libraries (onnxruntime, torch) take seconds to import and the API doesn't need them
     from ml.config import ConfigError, get_settings
 
     try:
