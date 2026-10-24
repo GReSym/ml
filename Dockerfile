@@ -21,6 +21,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --locked --no-dev --no-install-project
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libatomic1 && \
+    rm -rf /var/lib/apt/lists/*
+
 # GPU builds replace the locked CPU torch with a build from TORCH_INDEX_URL (set by deploy/manage.sh setup from
 # TORCH_BACKEND). Not locked on purpose: nightly GPU wheels disappear from the index after a few weeks.
 # The rest of the environment stays as locked; torch's own GPU dependencies (triton, nvidia-*/rocm-*) come from the same index.
