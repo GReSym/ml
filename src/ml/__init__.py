@@ -32,6 +32,18 @@ def main() -> None:
     stale.add_argument("--ids-only", action="store_true",
                        help="print only comma-separated ids (for `ml vectorize --ids`)")
 
+    evaluate = commands.add_parser("evaluate", help="offline evaluation on the collected Steam users (writes nothing)")
+    evaluate.add_argument("--k", type=_parse_ids, default=[5, 10, 20], help="cut-offs, comma-separated (default 5,10,20)")
+    evaluate.add_argument("--test-size", type=int, default=3, help="hidden games per user (default 3)")
+    evaluate.add_argument("--min-train-games", type=int, default=5, help="liked games left after hiding (default 5)")
+    evaluate.add_argument("--min-playtime", type=int, default=60, help="minutes for an unreviewed game to count (default 60)")
+    evaluate.add_argument("--test-selection", choices=["top", "random-liked"], default="top")
+    evaluate.add_argument("--seed", type=int, default=42)
+    evaluate.add_argument("--hybrid-betas", type=lambda v: [float(b) for b in v.split(",") if b.strip()],
+                          default=[0.05, 0.1, 0.2, 0.4], help="β of the hybrid strategies (default 0.05,0.1,0.2,0.4)")
+    evaluate.add_argument("--center", action="store_true", help="mean-centered vectors for the vector strategies")
+    evaluate.add_argument("--json", type=Path, help="also write the full report (as stored by the API) to this file")
+
     export = commands.add_parser("export", help="back up the game vectors from Milvus into an .npz file")
     export.add_argument("--out", type=Path, help="target file (default milvus-<collection>-<date>.npz)")
     export.add_argument("--collection", help="collection to export (default milvus.collection)")
@@ -72,6 +84,35 @@ def main() -> None:
             from ml.staleness import print_report
 
             print_report(settings, limit=args.limit, reasons=args.reason, ids_only=args.ids_only)
+        case "evaluate":
+            import json
+
+            from pydantic import ValidationError
+
+            from ml.db import GameRepository
+            from ml.evaluation import EvaluationError, EvaluationParams, format_report, run_evaluation
+            from ml.vectors import GameVectorStore
+
+            try:
+                params = EvaluationParams(
+                    ks=args.k, test_size=args.test_size, min_train_games=args.min_train_games,
+                    min_playtime_minutes=args.min_playtime, test_selection=args.test_selection, seed=args.seed,
+                    hybrid_betas=args.hybrid_betas, center=args.center,
+                )
+            except ValidationError as e:
+                sys.exit(f"Invalid parameters: {e}")
+            games = GameRepository(settings.database)
+            store = GameVectorStore(settings.milvus, settings.model)
+            try:
+                report = run_evaluation(params, store, games)
+            except EvaluationError as e:
+                sys.exit(f"Error: {e}")
+            finally:
+                games.close()
+                store.close()
+            print(format_report(report))
+            if args.json:
+                args.json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         case "export" | "import":
             from ml.backup import BackupError, export_vectors, import_vectors
 

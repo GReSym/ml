@@ -201,23 +201,34 @@ class GameVectorStore:
         finally:
             iterator.close()
 
-    def get_vectors(self, ids: list[int]) -> dict[int, list[float]]:
-        if not ids:
-            return {}
-        rows = self._client.get(self._collection, ids=list(ids), output_fields=[VECTOR_FIELD])
-        return {row["id"]: list(row[VECTOR_FIELD]) for row in rows}
+    def get_vectors(self, ids: list[int], batch_size: int = 1000) -> dict[int, list[float]]:
+        """In batches: a 1024-dim vector is 4 KB, so thousands of ids in one gRPC reply get too large."""
+        ids = list(ids)
+        result: dict[int, list[float]] = {}
+        for start in range(0, len(ids), batch_size):
+            rows = self._client.get(self._collection, ids=ids[start:start + batch_size], output_fields=[VECTOR_FIELD])
+            result.update((row["id"], list(row[VECTOR_FIELD])) for row in rows)
+        return result
 
     def search(self, vector: list[float], limit: int, exclude_ids: list[int]) -> list[tuple[int, float]]:
         """Nearest games by cosine similarity, as (game_id, score), best first."""
+        return self.search_many([vector], limit, exclude_ids)[0]
+
+    def search_many(
+        self, vectors: list[list[float]], limit: int, exclude_ids: list[int]
+    ) -> list[list[tuple[int, float]]]:
+        """One search request for several query vectors: a (game_id, score) list per query, best first."""
+        if not vectors:
+            return []
         result = self._client.search(
             self._collection,
-            data=[vector],
+            data=vectors,
             anns_field=VECTOR_FIELD,
             limit=limit,
             filter=f"id not in {list(exclude_ids)}" if exclude_ids else "",
             search_params={"metric_type": "COSINE", "params": {"ef": max(64, limit * 2)}},
         )
-        return [(hit["id"], float(hit["distance"])) for hit in result[0]]
+        return [[(hit["id"], float(hit["distance"])) for hit in hits] for hits in result]
 
     def count(self) -> int:
         rows = self._client.query(

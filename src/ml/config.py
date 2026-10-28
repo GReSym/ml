@@ -48,8 +48,16 @@ class RabbitMqSettings(BaseModel):
     queue: str
     dead_letter_queue: str
     routing_key: str
-    delivery_limit: int
+    delivery_limit: int  # also used for the evaluation results queue
     prefetch: int
+    # Offline evaluation (ml.evaluation): API → evaluation_queue → worker → evaluation_results_queue → API
+    evaluation_queue: str
+    evaluation_dead_letter_queue: str
+    evaluation_routing_key: str
+    evaluation_delivery_limit: int
+    evaluation_results_queue: str
+    evaluation_results_dead_letter_queue: str
+    evaluation_results_routing_key: str
 
 
 class ModelSettings(BaseModel):
@@ -87,6 +95,19 @@ class StalenessSettings(BaseModel):
     growth_ratio: float  # ...and by at least this share of the old count
 
 
+class SteamSettings(BaseModel):
+    """Only used by scripts/collect_steam_users.py, which checks the secrets itself."""
+    api_key: str = ""  # Steam Web API key (GetPlayerSummaries, GetOwnedGames)
+    anonymization_salt: str = ""  # HMAC key for steam_id_hash; keep it stable, or re-collected users get new hashes
+    request_delay_seconds: float = 1.0  # between Steam Web API / store requests
+    community_delay_seconds: float = 3.0  # between steamcommunity.com page requests (stricter rate limit)
+    min_played_games: int = 20  # a user needs MORE than this many played games that are in our catalogue
+    min_reviews: int = 5  # ...and at least this many reviews in the profile
+    min_playtime_minutes: int = 60  # a game counts as played from this playtime on
+    friends_per_user: int = 10  # friends sampled from each visited user (snowball over the friend graph)
+    max_depth: int = 4  # hops from the seed profiles
+
+
 class ApiSettings(BaseModel):
     host: str
     port: int
@@ -100,6 +121,7 @@ class Settings(BaseModel):
     reviews: ReviewSettings
     staleness: StalenessSettings
     api: ApiSettings
+    steam: SteamSettings = SteamSettings()
 
 
 class ConfigError(Exception):

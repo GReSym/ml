@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from ml import recommend as rec
+from ml.catalogue import CatalogueCache
 from ml.config import get_settings
 from ml.db import GameRepository
 from ml.staleness import Reason, filter_items, find_stale
@@ -30,6 +31,8 @@ class RatingDto(CamelModel):
 class RecommendationsRequest(CamelModel):
     ratings: list[RatingDto] = Field(max_length=5000)
     limit: int = Field(default=20, ge=1, le=100)
+    # 0 = pure similarity (the most niche games), 100 = strongly favours popular games; None = the default
+    mainstream: int | None = Field(default=None, ge=0, le=100)
 
 
 class ScoredGameDto(CamelModel):
@@ -39,7 +42,8 @@ class ScoredGameDto(CamelModel):
 
 class RecommendationsResponse(CamelModel):
     items: list[ScoredGameDto]
-    used_ratings: int
+    used_ratings: int  # liked games with a vector (dislikes don't influence the kNN algorithm)
+    mainstream: int
 
 
 class SimilarResponse(CamelModel):
@@ -76,6 +80,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = GameVectorStore(settings.milvus, settings.model)
     store.ensure_collection()
     app.state.store = store
+    # Loaded on the first recommendation request, so the API starts even if MariaDB is briefly unavailable
+    app.state.catalogue = CatalogueCache(settings, store)
     yield
     store.close()
 
@@ -101,8 +107,9 @@ def health() -> HealthResponse:
 @app.post("/recommendations", response_model=RecommendationsResponse, response_model_by_alias=True)
 def recommendations(request: RecommendationsRequest) -> RecommendationsResponse:
     ratings = [rec.Rating(r.game_id, r.rating, r.recommend) for r in request.ratings]
-    result = rec.recommend(_store(), ratings, request.limit)
-    return RecommendationsResponse(items=_scored(result.items), used_ratings=result.used_ratings)
+    mainstream = rec.DEFAULT_MAINSTREAM if request.mainstream is None else request.mainstream
+    result = rec.recommend(_store(), app.state.catalogue.get(), ratings, request.limit, mainstream)
+    return RecommendationsResponse(items=_scored(result.items), used_ratings=result.used_ratings, mainstream=mainstream)
 
 
 @app.get("/games/{game_id}/similar", response_model=SimilarResponse, response_model_by_alias=True)

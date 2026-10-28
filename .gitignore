@@ -13,3 +13,6 @@ Qwen3-Embedding-onnx/
 
 # Local config with secrets (see config.example.json)
 config.json
+
+# Collected Steam users (scripts/collect_steam_users.py), personal data even if anonymized
+data/

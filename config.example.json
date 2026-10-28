@@ -23,7 +23,14 @@
     "dead_letter_queue": "ml.vectorize-game.dlq",
     "routing_key": "game.vectorize",
     "delivery_limit": 5,
-    "prefetch": 4
+    "prefetch": 4,
+    "evaluation_queue": "ml.evaluate",
+    "evaluation_dead_letter_queue": "ml.evaluate.dlq",
+    "evaluation_routing_key": "evaluation.run",
+    "evaluation_delivery_limit": 2,
+    "evaluation_results_queue": "api.evaluation-results",
+    "evaluation_results_dead_letter_queue": "api.evaluation-results.dlq",
+    "evaluation_results_routing_key": "evaluation.result"
   },
   "model": {
     "name": "Qwen/Qwen3-Embedding-0.6B",
@@ -54,5 +61,16 @@
   "api": {
     "host": "127.0.0.1",
     "port": 8000
+  },
+  "steam": {
+    "api_key": "",
+    "anonymization_salt": "",
+    "request_delay_seconds": 1.0,
+    "community_delay_seconds": 3.0,
+    "min_played_games": 20,
+    "min_reviews": 5,
+    "min_playtime_minutes": 60,
+    "friends_per_user": 10,
+    "max_depth": 4
   }
 }

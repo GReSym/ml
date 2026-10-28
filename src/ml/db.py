@@ -37,6 +37,28 @@ class GameChangeInfo:
     steam_negative: int | None
 
 
+@dataclass(frozen=True)
+class SteamUserGame:
+    game_id: int
+    playtime_minutes: int
+    recommended: bool | None  # the user's own Steam review, None without one
+
+
+@dataclass(frozen=True)
+class SteamUserData:
+    """An anonymized Steam user collected for offline evaluation (steam_users + steam_user_games)."""
+    id: int
+    name: str
+    games: list[SteamUserGame]
+
+
+@dataclass(frozen=True)
+class EvaluationRunRow:
+    id: int
+    status: str
+    parameters: str  # JSON
+
+
 class GameRepository:
     """Not thread-safe: use one instance per thread."""
 
@@ -136,6 +158,61 @@ class GameRepository:
         with self._connect().cursor() as cursor:
             cursor.execute(sql, params)
             return [row["id"] for row in cursor.fetchall()]
+
+    def get_steam_app_ids(self) -> dict[int, int]:
+        """Steam app id → game id for every game from Steam."""
+        with self._connect().cursor() as cursor:
+            cursor.execute("SELECT steam_app_id, game_id FROM steam_source WHERE game_id IS NOT NULL")
+            return {row["steam_app_id"]: row["game_id"] for row in cursor.fetchall()}
+
+    def get_popular_game_ids(self, limit: int) -> list[int]:
+        """Most recommended games first: the same order as the API's popular fallback."""
+        with self._connect().cursor() as cursor:
+            cursor.execute(
+                "SELECT g.id FROM games g LEFT JOIN steam_source s ON s.game_id = g.id "
+                "ORDER BY s.recommendations_count IS NULL, s.recommendations_count DESC, g.id LIMIT %s",
+                [limit],
+            )
+            return [row["id"] for row in cursor.fetchall()]
+
+    def get_recommendation_counts(self) -> dict[int, int]:
+        """Game id → Steam recommendations count, for games that have one (the popularity used by the hybrid)."""
+        with self._connect().cursor() as cursor:
+            cursor.execute(
+                "SELECT game_id, recommendations_count FROM steam_source "
+                "WHERE game_id IS NOT NULL AND recommendations_count IS NOT NULL"
+            )
+            return {row["game_id"]: row["recommendations_count"] for row in cursor.fetchall()}
+
+    def get_titles(self, ids: list[int]) -> dict[int, str]:
+        if not ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(ids))
+        with self._connect().cursor() as cursor:
+            cursor.execute(f"SELECT id, title FROM games WHERE id IN ({placeholders})", ids)
+            return {row["id"]: row["title"] for row in cursor.fetchall()}
+
+    def get_steam_users(self) -> list[SteamUserData]:
+        """Every collected Steam user with their games (in our catalogue), by user id."""
+        with self._connect().cursor() as cursor:
+            cursor.execute("SELECT id, name FROM steam_users ORDER BY id")
+            users = {row["id"]: (row["name"], []) for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT steam_user_id, game_id, playtime_minutes, recommended FROM steam_user_games "
+                "ORDER BY steam_user_id, game_id"
+            )
+            for row in cursor.fetchall():
+                user = users.get(row["steam_user_id"])
+                if user is not None:
+                    recommended = None if row["recommended"] is None else bool(row["recommended"])
+                    user[1].append(SteamUserGame(row["game_id"], row["playtime_minutes"], recommended))
+        return [SteamUserData(user_id, name, games) for user_id, (name, games) in users.items()]
+
+    def get_evaluation_run(self, run_id: int) -> EvaluationRunRow | None:
+        with self._connect().cursor() as cursor:
+            cursor.execute("SELECT id, status, parameters FROM evaluation_runs WHERE id = %s", [run_id])
+            row = cursor.fetchone()
+        return None if row is None else EvaluationRunRow(row["id"], row["status"], row["parameters"])
 
     def close(self) -> None:
         if self._connection is not None:

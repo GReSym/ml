@@ -74,10 +74,11 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 ```text
 .
 ├── src/ml/
-│   ├── __init__.py          # CLI: ml api | worker | vectorize | stale
+│   ├── __init__.py          # CLI: ml api | worker | vectorize | stale | evaluate | export | import
 │   ├── config.py            # Загрузка конфигурации
 │   ├── backup.py            # Резервная копия векторов (ml export / ml import)
 │   ├── db.py                # Чтение игр и отзывов из MariaDB
+│   ├── evaluation.py        # Офлайн-оценка рекомендаций (leave-k-out, базовые стратегии, метрики)
 │   ├── text.py              # Очистка HTML, шаблон текста игры, хэш текста
 │   ├── reviews.py           # Очистка и отбор отзывов, вес отзывов
 │   ├── embedder.py          # Модель эмбеддингов (ONNX Runtime через FastEmbed или Sentence Transformers)
@@ -111,8 +112,9 @@ GPU (AMD ROCm или NVIDIA CUDA) включается в Docker настрой�
 ```bash
 uv sync
 uv pip uninstall torch
-uv pip install --prerelease allow --index https://download.pytorch.org/whl/nightly/rocm10.1 torch   # или .../nightly/cu134
-# в config.json: "model": {"device": "cuda", "dtype": "bfloat16"}  (для ROCm тоже cuda)
+uv pip install --prerelease allow --index https://download.pytorch.org/whl/rocm7.14 torch   # или .../cu132
+# индекс версионный (rocm7.14 / cu132) и меняется с релизами torch/ROCm — сверяйтесь с https://download.pytorch.org/whl/
+# в config.json: "model": {"device": "cuda", "dtype": "bfloat16"}  (для ROCm тоже cuda; на RX 6600 быстрее float16)
 uv run --no-sync ml worker
 ```
 
@@ -239,6 +241,18 @@ uv run ml import backup.npz --collection test --yes   # в другую колл
 ```
 
 Файл содержит все поля, включая векторы, и не зависит от версии Milvus. Импорт проверяет модель и размерность.
+
+### Офлайн-оценка рекомендаций
+
+```bash
+uv run python scripts/collect_steam_users.py --seeds <профиль> --count 200   # сбор анонимизированных пользователей Steam (через списки друзей) → data/steam-users.json
+uv run ml evaluate                                          # Precision/Recall/HitRate/nDCG@K, MRR против popular и random
+uv run ml evaluate --test-selection random-liked --json report.json
+```
+
+Для сбора нужны `steam.api_key` и `steam.anonymization_salt` в `config.json`. Файл импортируется в БД через backend
+(`POST /api/admin/evaluation/steam-users/import`), а запуск через API (`POST /api/admin/evaluation/runs`) обрабатывает worker.
+Подробности: `docs/evaluation.md` в корне проекта.
 
 ### Docker
 

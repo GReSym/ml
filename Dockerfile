@@ -21,12 +21,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --locked --no-dev --no-install-project
 
+# libatomic1: the ROCm torch wheel imports libatomic, which python:3.14-slim lacks (worker crashed on `import torch`).
+# libnuma1: a runtime dependency of the ROCm stack. It does NOT silence the "E-001h rocSHMEM Could not open libnuma"
+# startup warning (verified 2026-10-24; probably wants the unversioned libnuma.so) — the warning is harmless and
+# left as is, see docs/known-issues.md.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libatomic1 && \
+    apt-get install -y --no-install-recommends libatomic1 libnuma1 && \
     rm -rf /var/lib/apt/lists/*
 
 # GPU builds replace the locked CPU torch with a build from TORCH_INDEX_URL (set by deploy/manage.sh setup from
-# TORCH_BACKEND). Not locked on purpose: nightly GPU wheels disappear from the index after a few weeks.
+# TORCH_BACKEND; stable indexes https://download.pytorch.org/whl/rocm7.14 / cu132). The wheel is not pinned in uv.lock:
+# each torch/ROCm release moves it, so the index in deploy/manage.sh has to be revisited when a newer torch is wanted
+# (TORCH_INDEX_URL=<url> ./manage.sh setup overrides it without editing manage.sh).
 # The rest of the environment stays as locked; torch's own GPU dependencies (triton, nvidia-*/rocm-*) come from the same index.
 # Uninstall first: otherwise uv keeps the installed CPU torch as satisfying "torch". `--index` (not --index-url) gives the
 # torch index priority over PyPI, which also has torch (with CUDA) and would win under uv's first-index strategy.
