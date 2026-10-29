@@ -5,7 +5,7 @@ vectors plus a small popularity term. The averaged taste profile (`build_profile
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, get_args
 
 import numpy as np
 
@@ -27,6 +27,18 @@ DEFAULT_MAINSTREAM = 10
 MAX_BETA = 0.5
 # Most popular games (the user hasn't rated) added to the kNN candidates when β > 0
 POPULAR_CANDIDATES = 1000
+
+# How disliked games change the kNN ranking (docs/evaluation.md, "Disliked games"):
+# - centroid: score −= λ·cos(game, weighted mean of the dislikes)
+# - knn: score −= λ·(best weighted similarity to a single disliked game)
+# - margin: score −= λ·max(0, best dislike similarity − best like similarity): only games closer to a dislike than to any like
+# - exclude: the nearest neighbours of the disliked games are never recommended (λ unused)
+# - rocchio: every liked query moves away from the dislikes near it, l ← normalize(l − λ·Σ max(0, cos(l, d))·|w|·d),
+#   the closed form of DEO-style query optimization (pull to positives, push from negatives) applied per liked game
+DislikeMode = Literal["centroid", "knn", "margin", "exclude", "rocchio"]
+DISLIKE_MODES: tuple[DislikeMode, ...] = get_args(DislikeMode)
+DISLIKE_MODE: DislikeMode = "margin"
+DISLIKE_LAMBDA = 0.0  # 0 = dislikes are ignored
 
 
 @dataclass(frozen=True)
@@ -82,9 +94,10 @@ def build_profile(ratings: list[Rating], vectors: dict[int, list[float]]) -> tup
     return profile, len(liked) + len(disliked)
 
 
-def liked_matrix(ratings: list[Rating], vectors: dict[int, list[float]]) -> tuple[np.ndarray, np.ndarray]:
-    """(vectors n×d, weights n) of the liked games that have a vector, highest weight first."""
-    pairs = [(rating_weight(r), vectors[r.game_id]) for r in ratings if r.game_id in vectors and rating_weight(r) > 0]
+def _weighted_matrix(ratings: list[Rating], vectors: dict[int, list[float]], sign: int) -> tuple[np.ndarray, np.ndarray]:
+    """(vectors n×d, |weights| n) of the rated games with a vector and a weight of the given sign, highest |weight| first."""
+    pairs = [(abs(w), vectors[r.game_id]) for r in ratings
+             if r.game_id in vectors and (w := rating_weight(r)) * sign > 0]
     pairs.sort(key=lambda pair: -pair[0])
     if not pairs:
         return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float32)
@@ -92,16 +105,71 @@ def liked_matrix(ratings: list[Rating], vectors: dict[int, list[float]]) -> tupl
             np.asarray([weight for weight, _ in pairs], dtype=np.float32))
 
 
+def liked_matrix(ratings: list[Rating], vectors: dict[int, list[float]]) -> tuple[np.ndarray, np.ndarray]:
+    """(vectors n×d, weights n) of the liked games that have a vector, highest weight first."""
+    return _weighted_matrix(ratings, vectors, 1)
+
+
+def disliked_matrix(ratings: list[Rating], vectors: dict[int, list[float]]) -> tuple[np.ndarray, np.ndarray]:
+    """(vectors n×d, |weights| n) of the disliked games that have a vector, strongest dislike first."""
+    return _weighted_matrix(ratings, vectors, -1)
+
+
 def knn_scores(candidates: np.ndarray, liked: np.ndarray, weights: np.ndarray, top: int = KNN_TOP) -> np.ndarray:
     """Item-kNN score of every candidate row: the mean of its `top` best weighted similarities to single liked games.
 
     Unlike the averaged profile, a game close to one part of the user's taste scores high even when the user
     likes several unrelated genres (the average of those lands between them, near no game the user would pick).
-    Disliked games are ignored here.
+    Disliked games are handled separately (`dislike_penalty`, `rocchio_shift`, `dislike_neighbours`).
     """
     sims = (candidates @ liked.T) * weights
     top = min(top, sims.shape[1])
     return np.partition(sims, sims.shape[1] - top, axis=1)[:, -top:].mean(axis=1)
+
+
+def dislike_penalty(
+    candidates: np.ndarray,
+    disliked: np.ndarray,
+    dweights: np.ndarray,
+    mode: DislikeMode,
+    liked: np.ndarray | None = None,
+    weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Penalty of every candidate row for modes centroid/knn/margin (see DISLIKE_MODE); zeros without dislikes.
+
+    `margin` needs the liked rows: a game as close to a liked game as to a disliked one isn't penalized, because on Steam
+    a dislike is usually one disappointing game from a genre the user otherwise plays.
+    """
+    if not len(disliked):
+        return np.zeros(len(candidates), dtype=np.float32)
+    if mode == "centroid":
+        centroid = _normalize(dweights @ disliked)
+        return candidates @ centroid if centroid is not None else np.zeros(len(candidates), dtype=np.float32)
+    nearest_dislike = ((candidates @ disliked.T) * dweights).max(axis=1)
+    if mode == "knn":
+        return nearest_dislike
+    if mode == "margin":
+        nearest_like = ((candidates @ liked.T) * weights).max(axis=1)
+        return np.maximum(0, nearest_dislike - nearest_like)
+    raise ValueError(f"{mode} isn't a penalty mode")
+
+
+def rocchio_shift(liked: np.ndarray, disliked: np.ndarray, dweights: np.ndarray, gamma: float) -> np.ndarray:
+    """Liked rows moved away from the disliked games near each of them, normalized again (unchanged without dislikes)."""
+    if not len(disliked) or not len(liked) or gamma == 0:
+        return liked
+    pull = np.maximum(0, liked @ disliked.T) * dweights
+    shifted = liked - gamma * (pull @ disliked)
+    norms = np.linalg.norm(shifted, axis=1, keepdims=True)
+    return shifted / np.where(norms > 0, norms, 1)
+
+
+def dislike_neighbours(store: GameVectorStore, disliked: np.ndarray, exclude_ids: list[int]) -> set[int]:
+    """The nearest games of the strongest dislikes (mode `exclude`), one Milvus request."""
+    if not len(disliked):
+        return set()
+    hits = store.search_many(disliked[:KNN_QUERIES].tolist(), KNN_NEIGHBOURS, exclude_ids)
+    return {game_id for query in hits for game_id, _ in query}
 
 
 def center(vectors: np.ndarray, mean: np.ndarray | None) -> np.ndarray:
@@ -139,13 +207,25 @@ def recommend(
     mainstream: int = DEFAULT_MAINSTREAM,
     exclude_ids: list[int] | None = None,
 ) -> Recommendations:
-    """Centered item-kNN + β·popularity. Rated games are never recommended; `exclude_ids` hides more."""
+    """Centered item-kNN + β·popularity, minus the dislike penalty (DISLIKE_MODE, DISLIKE_LAMBDA).
+
+    Rated games are never recommended; `exclude_ids` hides more.
+    """
     rated_ids = [rating.game_id for rating in ratings]
-    liked, weights = liked_matrix(ratings, store.get_vectors(rated_ids))
+    rated_vectors = store.get_vectors(rated_ids)
+    liked, weights = liked_matrix(ratings, rated_vectors)
     if not len(liked):
         return Recommendations(items=[], used_ratings=0)
     liked = center(liked, stats.mean)
     excluded = set(rated_ids) | set(exclude_ids or [])
+
+    disliked, dweights = disliked_matrix(ratings, rated_vectors) if DISLIKE_LAMBDA > 0 else (np.empty((0, 0)), None)
+    if len(disliked):
+        disliked = center(disliked, stats.mean)
+        if DISLIKE_MODE == "rocchio":
+            liked = rocchio_shift(liked, disliked, dweights, DISLIKE_LAMBDA)
+        elif DISLIKE_MODE == "exclude":
+            excluded |= dislike_neighbours(store, disliked, sorted(excluded))
 
     fetched = store.get_vectors(knn_candidates(store, liked, sorted(excluded)))
     pool = list(fetched)
@@ -157,12 +237,16 @@ def recommend(
         extra = extra[:POPULAR_CANDIDATES]
         pool += [game_id for _, game_id in extra]
         rows.append(stats.popular_vectors[[row for row, _ in extra]].reshape(len(extra), -1))
+    used = len(liked) + len(disliked)
     if not pool:
-        return Recommendations(items=[], used_ratings=len(liked))
+        return Recommendations(items=[], used_ratings=used)
 
-    scores = knn_scores(np.concatenate(rows), liked, weights) + beta * stats.popularity(pool)
+    matrix = np.concatenate(rows)
+    scores = knn_scores(matrix, liked, weights) + beta * stats.popularity(pool)
+    if len(disliked) and DISLIKE_MODE in ("centroid", "knn", "margin"):
+        scores -= DISLIKE_LAMBDA * dislike_penalty(matrix, disliked, dweights, DISLIKE_MODE, liked, weights)
     order = np.argsort(-scores, kind="stable")[:limit]
-    return Recommendations(items=[(pool[i], float(scores[i])) for i in order], used_ratings=len(liked))
+    return Recommendations(items=[(pool[i], float(scores[i])) for i in order], used_ratings=used)
 
 
 def popularity(counts: np.ndarray, max_count: int) -> np.ndarray:

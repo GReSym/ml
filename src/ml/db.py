@@ -184,6 +184,18 @@ class GameRepository:
             )
             return {row["game_id"]: row["recommendations_count"] for row in cursor.fetchall()}
 
+    def get_game_tags(self) -> tuple[list[int], list[int]]:
+        """(game ids, tag ids) of every game_tags row, ~3.2 M pairs, streamed without per-row dicts."""
+        game_ids: list[int] = []
+        tag_ids: list[int] = []
+        with self._connect().cursor(pymysql.cursors.SSCursor) as cursor:
+            cursor.execute("SELECT game_id, tag_id FROM game_tags")
+            while rows := cursor.fetchmany(100_000):
+                for game_id, tag_id in rows:
+                    game_ids.append(game_id)
+                    tag_ids.append(tag_id)
+        return game_ids, tag_ids
+
     def get_titles(self, ids: list[int]) -> dict[int, str]:
         if not ids:
             return {}
