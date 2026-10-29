@@ -37,8 +37,45 @@ POPULAR_CANDIDATES = 1000
 #   the closed form of DEO-style query optimization (pull to positives, push from negatives) applied per liked game
 DislikeMode = Literal["centroid", "knn", "margin", "exclude", "rocchio"]
 DISLIKE_MODES: tuple[DislikeMode, ...] = get_args(DislikeMode)
-DISLIKE_MODE: DislikeMode = "margin"
-DISLIKE_LAMBDA = 0.0  # 0 = dislikes are ignored
+PENALTY_MODES: tuple[DislikeMode, ...] = ("centroid", "knn", "margin")
+
+# The user's dislike setting (backend `user_settings`): only the modes a user can understand, mapped to the ones above.
+# None of them beat ignoring dislikes in the evaluation, so `ignore` is the default and the rest are opt-in.
+UserDislikeMode = Literal["ignore", "penalize_closer", "penalize_similar", "hide_similar"]
+USER_DISLIKE_MODES: dict[UserDislikeMode, DislikeMode | None] = {
+    "ignore": None,
+    "penalize_closer": "margin",
+    "penalize_similar": "knn",
+    "hide_similar": "exclude",
+}
+DEFAULT_USER_DISLIKE_MODE: UserDislikeMode = "ignore"
+# Dislike strength 0–100: λ = MAX_DISLIKE_LAMBDA · strength / 100 for the penalty modes,
+# neighbours hidden per dislike = strength for hide_similar (the default 50 = KNN_NEIGHBOURS, the evaluated behaviour)
+DEFAULT_DISLIKE_STRENGTH = 50
+MAX_DISLIKE_LAMBDA = 1.0
+
+
+@dataclass(frozen=True)
+class DislikeParams:
+    mode: DislikeMode | None = None  # None = dislikes are ignored
+    weight: float = 0.0  # λ of the penalty modes, γ of rocchio
+    neighbours: int = KNN_NEIGHBOURS  # exclude: nearest games hidden per dislike
+
+    @property
+    def active(self) -> bool:
+        if self.mode == "exclude":
+            return self.neighbours > 0
+        return self.mode is not None and self.weight > 0
+
+
+def dislike_params(mode: UserDislikeMode, strength: int) -> DislikeParams:
+    """The user's dislike setting → the algorithm's parameters. Strength 0 means no effect in every mode."""
+    internal = USER_DISLIKE_MODES[mode]
+    if internal is None:
+        return DislikeParams()
+    if internal == "exclude":
+        return DislikeParams(internal, neighbours=strength)
+    return DislikeParams(internal, weight=MAX_DISLIKE_LAMBDA * strength / 100)
 
 
 @dataclass(frozen=True)
@@ -135,7 +172,7 @@ def dislike_penalty(
     liked: np.ndarray | None = None,
     weights: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Penalty of every candidate row for modes centroid/knn/margin (see DISLIKE_MODE); zeros without dislikes.
+    """Penalty of every candidate row for modes centroid/knn/margin (see DislikeMode); zeros without dislikes.
 
     `margin` needs the liked rows: a game as close to a liked game as to a disliked one isn't penalized, because on Steam
     a dislike is usually one disappointing game from a genre the user otherwise plays.
@@ -164,11 +201,13 @@ def rocchio_shift(liked: np.ndarray, disliked: np.ndarray, dweights: np.ndarray,
     return shifted / np.where(norms > 0, norms, 1)
 
 
-def dislike_neighbours(store: GameVectorStore, disliked: np.ndarray, exclude_ids: list[int]) -> set[int]:
-    """The nearest games of the strongest dislikes (mode `exclude`), one Milvus request."""
-    if not len(disliked):
+def dislike_neighbours(
+    store: GameVectorStore, disliked: np.ndarray, exclude_ids: list[int], neighbours: int = KNN_NEIGHBOURS
+) -> set[int]:
+    """The `neighbours` nearest games of each of the strongest dislikes (mode `exclude`), one Milvus request."""
+    if not len(disliked) or neighbours <= 0:
         return set()
-    hits = store.search_many(disliked[:KNN_QUERIES].tolist(), KNN_NEIGHBOURS, exclude_ids)
+    hits = store.search_many(disliked[:KNN_QUERIES].tolist(), neighbours, exclude_ids)
     return {game_id for query in hits for game_id, _ in query}
 
 
@@ -206,8 +245,9 @@ def recommend(
     limit: int,
     mainstream: int = DEFAULT_MAINSTREAM,
     exclude_ids: list[int] | None = None,
+    dislikes: DislikeParams = DislikeParams(),
 ) -> Recommendations:
-    """Centered item-kNN + β·popularity, minus the dislike penalty (DISLIKE_MODE, DISLIKE_LAMBDA).
+    """Centered item-kNN + β·popularity, with the user's dislike handling (`dislikes`, ignored by default).
 
     Rated games are never recommended; `exclude_ids` hides more.
     """
@@ -219,13 +259,13 @@ def recommend(
     liked = center(liked, stats.mean)
     excluded = set(rated_ids) | set(exclude_ids or [])
 
-    disliked, dweights = disliked_matrix(ratings, rated_vectors) if DISLIKE_LAMBDA > 0 else (np.empty((0, 0)), None)
+    disliked, dweights = disliked_matrix(ratings, rated_vectors) if dislikes.active else (np.empty((0, 0)), None)
     if len(disliked):
         disliked = center(disliked, stats.mean)
-        if DISLIKE_MODE == "rocchio":
-            liked = rocchio_shift(liked, disliked, dweights, DISLIKE_LAMBDA)
-        elif DISLIKE_MODE == "exclude":
-            excluded |= dislike_neighbours(store, disliked, sorted(excluded))
+        if dislikes.mode == "rocchio":
+            liked = rocchio_shift(liked, disliked, dweights, dislikes.weight)
+        elif dislikes.mode == "exclude":
+            excluded |= dislike_neighbours(store, disliked, sorted(excluded), dislikes.neighbours)
 
     fetched = store.get_vectors(knn_candidates(store, liked, sorted(excluded)))
     pool = list(fetched)
@@ -243,8 +283,8 @@ def recommend(
 
     matrix = np.concatenate(rows)
     scores = knn_scores(matrix, liked, weights) + beta * stats.popularity(pool)
-    if len(disliked) and DISLIKE_MODE in ("centroid", "knn", "margin"):
-        scores -= DISLIKE_LAMBDA * dislike_penalty(matrix, disliked, dweights, DISLIKE_MODE, liked, weights)
+    if len(disliked) and dislikes.mode in PENALTY_MODES:
+        scores -= dislikes.weight * dislike_penalty(matrix, disliked, dweights, dislikes.mode, liked, weights)
     order = np.argsort(-scores, kind="stable")[:limit]
     return Recommendations(items=[(pool[i], float(scores[i])) for i in order], used_ratings=used)
 

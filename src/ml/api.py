@@ -33,6 +33,10 @@ class RecommendationsRequest(CamelModel):
     limit: int = Field(default=20, ge=1, le=100)
     # 0 = pure similarity (the most niche games), 100 = strongly favours popular games; None = the default
     mainstream: int | None = Field(default=None, ge=0, le=100)
+    # How disliked games act (the user's setting, see recommend.USER_DISLIKE_MODES); None = ignore
+    dislike_mode: rec.UserDislikeMode | None = None
+    # 0 = no effect; penalty weight or neighbours hidden per dislike, depending on the mode; None = the default (50)
+    dislike_strength: int | None = Field(default=None, ge=0, le=100)
 
 
 class ScoredGameDto(CamelModel):
@@ -42,8 +46,10 @@ class ScoredGameDto(CamelModel):
 
 class RecommendationsResponse(CamelModel):
     items: list[ScoredGameDto]
-    used_ratings: int  # liked games with a vector (dislikes don't influence the kNN algorithm)
+    used_ratings: int  # liked games with a vector, plus disliked ones when the dislike mode is active
     mainstream: int
+    dislike_mode: rec.UserDislikeMode
+    dislike_strength: int
 
 
 class SimilarResponse(CamelModel):
@@ -108,8 +114,12 @@ def health() -> HealthResponse:
 def recommendations(request: RecommendationsRequest) -> RecommendationsResponse:
     ratings = [rec.Rating(r.game_id, r.rating, r.recommend) for r in request.ratings]
     mainstream = rec.DEFAULT_MAINSTREAM if request.mainstream is None else request.mainstream
-    result = rec.recommend(_store(), app.state.catalogue.get(), ratings, request.limit, mainstream)
-    return RecommendationsResponse(items=_scored(result.items), used_ratings=result.used_ratings, mainstream=mainstream)
+    dislike_mode = request.dislike_mode or rec.DEFAULT_USER_DISLIKE_MODE
+    dislike_strength = rec.DEFAULT_DISLIKE_STRENGTH if request.dislike_strength is None else request.dislike_strength
+    result = rec.recommend(_store(), app.state.catalogue.get(), ratings, request.limit, mainstream,
+                           dislikes=rec.dislike_params(dislike_mode, dislike_strength))
+    return RecommendationsResponse(items=_scored(result.items), used_ratings=result.used_ratings, mainstream=mainstream,
+                                   dislike_mode=dislike_mode, dislike_strength=dislike_strength)
 
 
 @app.get("/games/{game_id}/similar", response_model=SimilarResponse, response_model_by_alias=True)

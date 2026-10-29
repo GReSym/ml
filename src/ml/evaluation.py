@@ -15,6 +15,9 @@ metrics measure how many hidden games come back in the top K. Strategies compare
 With `center`, every vector strategy works on mean-centered vectors (recommend.center).
 
 Filtered evaluation: only games that have a vector in Milvus take part (the system can't recommend anything else).
+
+Niche discovery: the same hits counted only on hidden games outside the `nicheHead` most popular games
+(`popular` scores ~0 there by construction), so finding liked games nobody plays becomes a number.
 """
 
 import logging
@@ -75,6 +78,7 @@ class EvaluationParams(BaseModel):
     dislike_betas: list[float] = Field(default=[0.0], max_length=10)
     hidden_dislikes: int = Field(default=0, ge=0, le=5)  # disliked games hidden per user (needs one more left in train)
     tags: bool = False  # tag-only strategies (loads ~3.2 M game_tags rows)
+    niche_head: int = Field(default=1000, ge=1, le=POPULAR_POOL)  # the niche metrics ignore hidden games this popular
 
     @field_validator("ks")
     @classmethod
@@ -178,6 +182,20 @@ def metrics_at(ranks: list[int], test_count: int, k: int) -> dict[str, float]:
         "recall": len(hits) / test_count,
         "hitRate": 1.0 if hits else 0.0,
         "ndcg": sum(1 / math.log2(r + 1) for r in hits) / ideal,
+    }
+
+
+def hits_spread(user_ranks: list[list[int]], names: list[str], k: int) -> dict:
+    """Hits in the top k per user: the fewest and the most, who got them, and how many users got each number of hits."""
+    hits = [sum(1 for r in ranks if r <= k) for ranks in user_ranks]
+    if not hits:
+        return {"k": k, "min": None, "max": None, "minUsers": [], "maxUsers": [], "distribution": {}}
+    low, high = min(hits), max(hits)
+    return {
+        "k": k, "min": low, "max": high,
+        "minUsers": [name for name, n in zip(names, hits) if n == low],
+        "maxUsers": [name for name, n in zip(names, hits) if n == high],
+        "distribution": {str(n): c for n, c in sorted(Counter(hits).items())},
     }
 
 
@@ -301,6 +319,12 @@ def evaluate(
     dislike_percentiles: dict[str, list[float]] = {s: [] for s in percentiles}
     dislike_ranks: dict[str, list[list[int]]] = {s: [] for s in strategies}
     test_counts: list[int] = []
+    # Niche metrics: only hidden games outside the popular head, only users who have such a game hidden
+    head = set(popular_ids[: params.niche_head])
+    niche_ranks: dict[str, list[list[int]]] = {s: [] for s in strategies}
+    niche_counts: list[int] = []
+    niche_names: list[str] = []
+    niche_percentiles: dict[str, list[float]] = {s: [] for s in percentiles}
     recommended_counts: dict[str, Counter[int]] = {s: Counter() for s in strategies}
 
     for done, user in enumerate(users, start=1):
@@ -454,6 +478,14 @@ def evaluate(
 
         test_set = set(test_ids)
         test_counts.append(test_count)
+        niche_test = [game_id for game_id in test_ids if game_id not in head]
+        if niche_test:
+            niche_counts.append(len(niche_test))
+            niche_names.append(user.name)
+            for strategy in strategies:
+                niche_ranks[strategy].append(hit_ranks(lists[strategy], set(niche_test)))
+            for strategy, values in user_percentiles.items():
+                niche_percentiles[strategy].extend(v for game_id, v in zip(test_ids, values) if game_id not in head)
         user_dislikes.append(len(disliked))
         user_ranks = {}
         for strategy in strategies:
@@ -472,6 +504,7 @@ def evaluate(
             "train": len(train),
             "dislikes": len(disliked),
             "test": test_ids,
+            "nicheTest": niche_test,
             "ranks": user_ranks,
             "rankPercentiles": {s: [round(v, 4) for v in values] for s, values in user_percentiles.items()},
             "recommended": {s: games for s, games in lists.items() if s != "random"},
@@ -493,6 +526,7 @@ def evaluate(
                 for name in ("precision", "recall", "hitRate", "ndcg")
             }
         summary["mrr"] = sum(1 / r[0] for r in ranks[strategy] if r) / evaluated if evaluated else 0.0
+        summary["hits"] = hits_spread(ranks[strategy], [u["name"] for u in per_user], max_k)
         # Share of the catalogue that appeared in anyone's top max K
         summary["coverage"] = len(recommended_counts[strategy]) / len(all_game_ids) if all_game_ids else 0.0
         # How mainstream the recommendations are: median Steam recommendations count over all recommended slots
@@ -504,6 +538,18 @@ def evaluate(
                 "median": statistics.median(values) if values else None,
                 "mean": statistics.fmean(values) if values else None,
             }
+        # The same metrics over the niche hidden games only (a hit on a head game doesn't count)
+        niche_users = len(niche_counts)
+        niche: dict = {"users": niche_users}
+        for k in params.ks:
+            values = [metrics_at(r, n, k) for r, n in zip(niche_ranks[strategy], niche_counts)]
+            niche[str(k)] = {name: (sum(v[name] for v in values) / niche_users if niche_users else 0.0)
+                             for name in ("recall", "hitRate")}
+        niche["mrr"] = sum(1 / r[0] for r in niche_ranks[strategy] if r) / niche_users if niche_users else 0.0
+        niche["hits"] = hits_spread(niche_ranks[strategy], niche_names, max_k)
+        if strategy in niche_percentiles and (values := niche_percentiles[strategy]):
+            niche["rankPercentile"] = {"median": statistics.median(values), "mean": statistics.fmean(values)}
+        summary["niche"] = niche
         if params.hidden_dislikes:
             # Higher rank percentile and lower hit rate = the strategy keeps the hidden disliked games away
             with_hidden = dislike_ranks[strategy]
@@ -536,6 +582,8 @@ def evaluate(
         "users": {"total": len(users), "evaluated": evaluated, "skipped": dict(skipped)},
         "filtered": dict(filtered),
         "rankSample": len(sample_ids),
+        "niche": {"head": params.niche_head, "users": len(niche_counts), "hiddenGames": sum(niche_counts),
+                  "hiddenGamesTotal": sum(test_counts)},
         "centered": mean is not None,
         "strategies": summaries,
         "paired": paired,
@@ -607,6 +655,20 @@ def run_evaluation(
     return report
 
 
+def _hits_lines(strategies: dict, spread: Callable[[dict], dict], label: str) -> list[str]:
+    """Per strategy: fewest/most hits per user, the users with the most, and the distribution (hits: users)."""
+    first = next(iter(strategies.values()), None)
+    if first is None or spread(first)["min"] is None:
+        return []
+    lines = ["", f"Per-user {label} in the top {spread(first)['k']}: min (users) / max (users with it), distribution hits:users"]
+    for strategy, summary in strategies.items():
+        h = spread(summary)
+        best = ", ".join(h["maxUsers"][:5]) + (f" +{len(h['maxUsers']) - 5}" if len(h["maxUsers"]) > 5 else "")
+        dist = " ".join(f"{n}:{c}" for n, c in h["distribution"].items())
+        lines.append(f"  {strategy:<36} {h['min']} ({len(h['minUsers'])}) / {h['max']} ({best})  [{dist}]")
+    return lines
+
+
 def format_report(report: dict) -> str:
     """Plain-text table for `ml evaluate`."""
     users = report["users"]
@@ -628,6 +690,19 @@ def format_report(report: dict) -> str:
         if (percentile := summary.get("rankPercentile")) and percentile["median"] is not None:
             extra += f", rank percentile median {percentile['median']:.2%} / mean {percentile['mean']:.2%}"
         lines.append(extra)
+    lines += _hits_lines(report["strategies"], lambda summary: summary["hits"], "hits")
+    if (niche := report.get("niche")) and niche["users"]:
+        ks = report["params"]["ks"]
+        lines += ["", (f"Niche discovery: hits on hidden games outside the top {niche['head']} popular only; "
+                       f"{niche['hiddenGames']} of {niche['hiddenGamesTotal']} hidden games, {niche['users']} users have one"),
+                  f"{'strategy':<36} " + " ".join(f"{'HR@' + str(k):>7} {'R@' + str(k):>7}" for k in ks)
+                  + f" {'MRR':>7} {'rank pct med/mean':>18}"]
+        for strategy, summary in report["strategies"].items():
+            n = summary["niche"]
+            pct = n.get("rankPercentile")
+            lines.append(f"{strategy:<36} " + " ".join(f"{n[str(k)]['hitRate']:>7.4f} {n[str(k)]['recall']:>7.4f}" for k in ks)
+                         + f" {n['mrr']:>7.4f} " + (f"{pct['median']:>8.2%} / {pct['mean']:.2%}" if pct else f"{'–':>18}"))
+        lines += _hits_lines(report["strategies"], lambda summary: summary["niche"]["hits"], "niche hits")
     if paired := report.get("paired"):
         first = next(iter(paired.values()))
         lines += ["", (f"Dislike strategies vs their base, users with dislikes in train ({first.get('users', 0)}), "
