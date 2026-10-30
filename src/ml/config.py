@@ -35,6 +35,7 @@ class MilvusSettings(BaseModel):
     uri: str
     token: str = ""
     collection: str
+    text_collection: str  # BM25 index of titles and descriptions (ml.text_index)
 
 
 class RabbitMqSettings(BaseModel):
@@ -48,7 +49,7 @@ class RabbitMqSettings(BaseModel):
     queue: str
     dead_letter_queue: str
     routing_key: str
-    delivery_limit: int  # also used for the evaluation results queue
+    delivery_limit: int  # also used for the evaluation and recommendation results queues
     prefetch: int
     # Offline evaluation (ml.evaluation): API → evaluation_queue → worker → evaluation_results_queue → API
     evaluation_queue: str
@@ -58,6 +59,14 @@ class RabbitMqSettings(BaseModel):
     evaluation_results_queue: str
     evaluation_results_dead_letter_queue: str
     evaluation_results_routing_key: str
+    # Recommendations (ml.personal): API → recommendation_queue → worker → recommendation_results_queue → API
+    recommendation_queue: str
+    recommendation_dead_letter_queue: str
+    recommendation_routing_key: str
+    recommendation_delivery_limit: int
+    recommendation_results_queue: str
+    recommendation_results_dead_letter_queue: str
+    recommendation_results_routing_key: str
 
 
 class ModelSettings(BaseModel):
@@ -108,6 +117,16 @@ class SteamSettings(BaseModel):
     max_depth: int = 4  # hops from the seed profiles
 
 
+class SearchSettings(BaseModel):
+    """Game search (ml.search): weighted RRF over the BM25 title/text lists and, for description queries, the dense list."""
+    dense: bool  # false: description queries are BM25-only and the API never loads the model
+    candidates: int = Field(ge=1, le=1000)  # hits taken from each list before fusion
+    rrf_k: int = Field(ge=1)
+    title_weight: float = Field(ge=0)
+    text_weight: float = Field(ge=0)
+    dense_weight: float = Field(ge=0)
+
+
 class ApiSettings(BaseModel):
     host: str
     port: int
@@ -120,6 +139,7 @@ class Settings(BaseModel):
     model: ModelSettings
     reviews: ReviewSettings
     staleness: StalenessSettings
+    search: SearchSettings
     api: ApiSettings
     steam: SteamSettings = SteamSettings()
 

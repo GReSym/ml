@@ -1,55 +1,25 @@
-"""HTTP API of the ML service, called synchronously by the ASP.NET backend.
+"""HTTP API of the ML service, called synchronously by the ASP.NET backend (game search, stale vectors; similar games and
+recommendations for debugging, the backend gets recommendations from the worker).
 
-Doesn't load the embedding model: recommendations only use vectors already stored in Milvus.
+Recommendations only use vectors already stored in Milvus. The embedding model is loaded only by the first
+description search (GET /search?exact=false), so the API starts in seconds and stays small until then.
 """
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
-from pydantic.alias_generators import to_camel
 
+from ml import personal
 from ml import recommend as rec
 from ml.catalogue import CatalogueCache
 from ml.config import get_settings
 from ml.db import GameRepository
+from ml.personal import CamelModel, RecommendationsRequest, RecommendationsResponse, ScoredGameDto, scored
+from ml.search import GameSearch, SearchMode
 from ml.staleness import Reason, filter_items, find_stale
+from ml.text_index import GameTextStore
 from ml.vectors import GameVectorStore
-
-
-class CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
-class RatingDto(CamelModel):
-    game_id: int
-    rating: int | None = Field(default=None, ge=rec.RATING_MIN, le=rec.RATING_MAX)
-    recommend: bool | None = None
-
-
-class RecommendationsRequest(CamelModel):
-    ratings: list[RatingDto] = Field(max_length=5000)
-    limit: int = Field(default=20, ge=1, le=100)
-    # 0 = pure similarity (the most niche games), 100 = strongly favours popular games; None = the default
-    mainstream: int | None = Field(default=None, ge=0, le=100)
-    # How disliked games act (the user's setting, see recommend.USER_DISLIKE_MODES); None = ignore
-    dislike_mode: rec.UserDislikeMode | None = None
-    # 0 = no effect; penalty weight or neighbours hidden per dislike, depending on the mode; None = the default (50)
-    dislike_strength: int | None = Field(default=None, ge=0, le=100)
-
-
-class ScoredGameDto(CamelModel):
-    game_id: int
-    score: float
-
-
-class RecommendationsResponse(CamelModel):
-    items: list[ScoredGameDto]
-    used_ratings: int  # liked games with a vector, plus disliked ones when the dislike mode is active
-    mainstream: int
-    dislike_mode: rec.UserDislikeMode
-    dislike_strength: int
 
 
 class SimilarResponse(CamelModel):
@@ -74,6 +44,11 @@ class StaleGamesResponse(CamelModel):
     items: list[StaleGameDto]
 
 
+class SearchResponse(CamelModel):
+    items: list[ScoredGameDto]
+    mode: SearchMode
+
+
 class HealthResponse(CamelModel):
     status: str
     collection: str
@@ -86,9 +61,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = GameVectorStore(settings.milvus, settings.model)
     store.ensure_collection()
     app.state.store = store
+    texts = GameTextStore(settings.milvus)
+    texts.ensure_collection()
+    app.state.search = GameSearch(settings, texts, store)
     # Loaded on the first recommendation request, so the API starts even if MariaDB is briefly unavailable
     app.state.catalogue = CatalogueCache(settings, store)
     yield
+    texts.close()
     store.close()
 
 
@@ -97,10 +76,6 @@ app = FastAPI(title="GReSym ML", lifespan=lifespan)
 
 def _store() -> GameVectorStore:
     return app.state.store
-
-
-def _scored(items: list[tuple[int, float]]) -> list[ScoredGameDto]:
-    return [ScoredGameDto(game_id=game_id, score=score) for game_id, score in items]
 
 
 # Sync endpoints: FastAPI runs them in a thread pool, so the blocking Milvus client doesn't block the event loop.
@@ -112,14 +87,8 @@ def health() -> HealthResponse:
 
 @app.post("/recommendations", response_model=RecommendationsResponse, response_model_by_alias=True)
 def recommendations(request: RecommendationsRequest) -> RecommendationsResponse:
-    ratings = [rec.Rating(r.game_id, r.rating, r.recommend) for r in request.ratings]
-    mainstream = rec.DEFAULT_MAINSTREAM if request.mainstream is None else request.mainstream
-    dislike_mode = request.dislike_mode or rec.DEFAULT_USER_DISLIKE_MODE
-    dislike_strength = rec.DEFAULT_DISLIKE_STRENGTH if request.dislike_strength is None else request.dislike_strength
-    result = rec.recommend(_store(), app.state.catalogue.get(), ratings, request.limit, mainstream,
-                           dislikes=rec.dislike_params(dislike_mode, dislike_strength))
-    return RecommendationsResponse(items=_scored(result.items), used_ratings=result.used_ratings, mainstream=mainstream,
-                                   dislike_mode=dislike_mode, dislike_strength=dislike_strength)
+    """Not used by the backend any more (it queues ml.recommend for the worker); kept for debugging."""
+    return personal.recommend(_store(), app.state.catalogue.get(), request)
 
 
 @app.get("/games/{game_id}/similar", response_model=SimilarResponse, response_model_by_alias=True)
@@ -127,7 +96,18 @@ def similar_games(game_id: int, limit: int = Query(default=10, ge=1, le=100)) ->
     items = rec.similar(_store(), game_id, limit)
     if items is None:
         raise HTTPException(status_code=404, detail=f"Game {game_id} has no vector")
-    return SimilarResponse(items=_scored(items))
+    return SimilarResponse(items=scored(items))
+
+
+@app.get("/search", response_model=SearchResponse, response_model_by_alias=True)
+def search(
+    q: str = Query(min_length=1, max_length=500),
+    exact: bool = Query(default=True, description="true: keywords only (BM25); false: also by meaning (loads the model)"),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> SearchResponse:
+    """Games ranked by relevance to the query (weighted RRF, see ml.search)."""
+    result = app.state.search.search(q.strip(), exact, limit)
+    return SearchResponse(items=scored([(game_id, round(score, 6)) for game_id, score in result.items]), mode=result.mode)
 
 
 @app.get("/vectorization/stale", response_model=StaleGamesResponse, response_model_by_alias=True)

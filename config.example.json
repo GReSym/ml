@@ -9,7 +9,8 @@
   "milvus": {
     "uri": "http://localhost:19530",
     "token": "",
-    "collection": "games_qwen3_06b_v2"
+    "collection": "games_qwen3_06b_v2",
+    "text_collection": "games_text_v1"
   },
   "rabbitmq": {
     "host": "localhost",
@@ -30,7 +31,14 @@
     "evaluation_delivery_limit": 2,
     "evaluation_results_queue": "api.evaluation-results",
     "evaluation_results_dead_letter_queue": "api.evaluation-results.dlq",
-    "evaluation_results_routing_key": "evaluation.result"
+    "evaluation_results_routing_key": "evaluation.result",
+    "recommendation_queue": "ml.recommend",
+    "recommendation_dead_letter_queue": "ml.recommend.dlq",
+    "recommendation_routing_key": "recommendation.run",
+    "recommendation_delivery_limit": 3,
+    "recommendation_results_queue": "api.recommendation-results",
+    "recommendation_results_dead_letter_queue": "api.recommendation-results.dlq",
+    "recommendation_results_routing_key": "recommendation.result"
   },
   "model": {
     "name": "Qwen/Qwen3-Embedding-0.6B",
@@ -57,6 +65,14 @@
     "sentiment_min_total": 50,
     "growth_min_new": 100,
     "growth_ratio": 0.2
+  },
+  "search": {
+    "dense": true,
+    "candidates": 100,
+    "rrf_k": 60,
+    "title_weight": 2.0,
+    "text_weight": 1.0,
+    "dense_weight": 2.0
   },
   "api": {
     "host": "127.0.0.1",

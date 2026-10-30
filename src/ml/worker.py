@@ -1,7 +1,11 @@
-"""RabbitMQ consumers: vectorizes games and runs offline evaluations requested by the backend.
+"""RabbitMQ consumers: vectorizes games, computes recommendations and runs offline evaluations requested by the backend.
 
 Messages (JSON):
 - routing key game.vectorize: {"gameId": 123, "reason": "updated"}
+- routing key recommendation.run: {"recommendationId": 5, "ratings": [...], "limit", "mainstream", "dislikeMode",
+  "dislikeStrength"} (personal.RecommendationsRequest + the id); the result goes back to the API as
+  {"recommendationId", "status": "completed"|"failed", "items"?: [{"gameId", "score"}], "usedRatings"?, "error"?, "at"}
+  (recommendation.result). "failed" only once retrying is pointless; the API then falls back to popular games
 - routing key evaluation.run: {"runId": 7}; progress and results go back to the API as
   {"runId", "status": "running"|"completed"|"failed", "results"?, "usersEvaluated"?, "error"?, "at"} (evaluation.result)
 Topology must match the backend's declaration exactly (backend: Infrastructure/Messaging/RabbitMqTopology.cs).
@@ -15,8 +19,10 @@ from datetime import UTC, datetime
 
 import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractExchange, AbstractIncomingMessage, AbstractQueue
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
+from ml import personal
+from ml.catalogue import CatalogueCache
 from ml.config import RabbitMqSettings, Settings
 from ml.db import GameRepository
 from ml.evaluation import EvaluationError, EvaluationParams, run_evaluation
@@ -70,6 +76,15 @@ async def declare_topology(channel: AbstractChannel, settings: RabbitMqSettings)
     await _declare_work_queue(
         channel, exchange, dlx, settings.evaluation_results_queue, settings.evaluation_results_dead_letter_queue,
         settings.evaluation_results_routing_key, settings.delivery_limit, settings.dead_letter_exchange,
+    )
+    await _declare_work_queue(
+        channel, exchange, dlx, settings.recommendation_queue, settings.recommendation_dead_letter_queue,
+        settings.recommendation_routing_key, settings.recommendation_delivery_limit, settings.dead_letter_exchange,
+    )
+    await _declare_work_queue(
+        channel, exchange, dlx, settings.recommendation_results_queue,
+        settings.recommendation_results_dead_letter_queue, settings.recommendation_results_routing_key,
+        settings.delivery_limit, settings.dead_letter_exchange,
     )
     return vectorize
 
@@ -136,20 +151,25 @@ def _evaluate_run(settings: Settings, run_id: int) -> dict:
         store.close()
 
 
-async def _publish_result(exchange: AbstractExchange, settings: RabbitMqSettings, run_id: int, status: str,
-                          **fields: object) -> None:
-    body = {"runId": run_id, "status": status, "at": datetime.now(UTC).isoformat(), **fields}
+async def _publish(exchange: AbstractExchange, routing_key: str, status: str, **fields: object) -> None:
+    """A report for the API: {**fields, "status", "at"}."""
+    body = {**fields, "status": status, "at": datetime.now(UTC).isoformat()}
     await exchange.publish(
         aio_pika.Message(
             json.dumps(body).encode(),
             content_type="application/json",
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
             message_id=str(uuid.uuid4()),
-            type=settings.evaluation_results_routing_key,
+            type=routing_key,
         ),
-        routing_key=settings.evaluation_results_routing_key,
+        routing_key=routing_key,
         mandatory=True,
     )
+
+
+async def _publish_result(exchange: AbstractExchange, settings: RabbitMqSettings, run_id: int, status: str,
+                          **fields: object) -> None:
+    await _publish(exchange, settings.evaluation_results_routing_key, status, runId=run_id, **fields)
 
 
 async def _handle_evaluation(message: AbstractIncomingMessage, settings: Settings, exchange: AbstractExchange) -> None:
@@ -185,6 +205,64 @@ async def _handle_evaluation(message: AbstractIncomingMessage, settings: Setting
     await message.ack()
 
 
+class RecommendTask(personal.RecommendationsRequest):
+    recommendation_id: int = Field(gt=0)
+
+
+def _parse_recommendation_id(message: AbstractIncomingMessage) -> int | None:
+    """Only the id, to report an otherwise invalid task as failed."""
+    try:
+        recommendation_id = json.loads(message.body)["recommendationId"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return recommendation_id if isinstance(recommendation_id, int) and recommendation_id > 0 else None
+
+
+async def _handle_recommendation(message: AbstractIncomingMessage, settings: RabbitMqSettings,
+                                 exchange: AbstractExchange, store: GameVectorStore,
+                                 catalogue: CatalogueCache) -> None:
+    async def publish(recommendation_id: int, status: str, **fields: object) -> None:
+        await _publish(exchange, settings.recommendation_results_routing_key, status,
+                       recommendationId=recommendation_id, **fields)
+
+    try:
+        task = RecommendTask.model_validate_json(message.body)
+    except ValidationError as e:
+        recommendation_id = _parse_recommendation_id(message)
+        if recommendation_id is None:
+            log.error("Malformed recommendation message %s, dead-lettering: %r", message.message_id, message.body[:200])
+            await message.reject(requeue=False)
+            return
+        # Retrying won't help: report it, so the API falls back to popular games
+        log.error("Invalid recommendation task %d: %s", recommendation_id, e)
+        await publish(recommendation_id, "failed", error=f"Invalid task: {e.error_count()} validation errors")
+        await message.ack()
+        return
+
+    try:
+        # Milvus searches are blocking: off the event loop. The first call also loads the catalogue stats (~6 s)
+        result = await asyncio.to_thread(lambda: personal.recommend(store, catalogue.get(), task))
+    except Exception as e:
+        # x-delivery-count = earlier failed deliveries; the broker dead-letters the message past x-delivery-limit.
+        # Report one attempt early, so a message never reaches the DLQ without the API hearing about it
+        failures = int(message.headers.get("x-delivery-count") or 0)
+        if failures < settings.recommendation_delivery_limit - 1:
+            # Maybe transient (Milvus/MariaDB down): requeue silently
+            log.exception("Recommendation %d failed (delivery count %d), requeueing", task.recommendation_id, failures)
+            await message.nack(requeue=True)
+            return
+        log.exception("Recommendation %d failed for the last time", task.recommendation_id)
+        await publish(task.recommendation_id, "failed", error=f"{type(e).__name__}: {e}")
+        await message.ack()
+        return
+
+    await publish(task.recommendation_id, "completed", items=[i.model_dump(by_alias=True) for i in result.items],
+                  usedRatings=result.used_ratings)
+    log.info("Recommendation %d: %d games from %d ratings", task.recommendation_id, len(result.items),
+             result.used_ratings)
+    await message.ack()
+
+
 async def _consume_vectorization(queue: AbstractQueue, vectorizer: Vectorizer) -> None:
     # Messages are handled one at a time: the vectorizer isn't thread-safe and the CPU is the bottleneck
     async with queue.iterator() as messages:
@@ -198,9 +276,20 @@ async def _consume_evaluations(queue: AbstractQueue, settings: Settings, exchang
             await _handle_evaluation(message, settings, exchange)
 
 
+async def _consume_recommendations(queue: AbstractQueue, settings: RabbitMqSettings, exchange: AbstractExchange,
+                                   store: GameVectorStore, catalogue: CatalogueCache) -> None:
+    # One at a time: a request takes ~0.3 s, and the Milvus client is shared
+    async with queue.iterator() as messages:
+        async for message in messages:
+            await _handle_recommendation(message, settings, exchange, store, catalogue)
+
+
 async def run_worker(settings: Settings) -> None:
     rabbit = settings.rabbitmq
     vectorizer = Vectorizer(settings)  # load the model before taking messages
+    # Recommendations get their own Milvus client (the vectorizer's isn't thread-safe); the catalogue loads on first use
+    store = GameVectorStore(settings.milvus, settings.model)
+    catalogue = CatalogueCache(settings, store)
     connection = await aio_pika.connect_robust(
         host=rabbit.host,
         port=rabbit.port,
@@ -220,10 +309,18 @@ async def run_worker(settings: Settings) -> None:
         evaluate = await evaluation_channel.get_queue(rabbit.evaluation_queue, ensure=False)
         exchange = await evaluation_channel.get_exchange(rabbit.exchange, ensure=False)
 
-        log.info("Waiting for messages on %s and %s", rabbit.queue, rabbit.evaluation_queue)
+        recommendation_channel = await connection.channel(publisher_confirms=True)
+        await recommendation_channel.set_qos(prefetch_count=rabbit.prefetch)
+        recommend = await recommendation_channel.get_queue(rabbit.recommendation_queue, ensure=False)
+        recommendation_exchange = await recommendation_channel.get_exchange(rabbit.exchange, ensure=False)
+
+        log.info("Waiting for messages on %s, %s and %s", rabbit.queue, rabbit.recommendation_queue,
+                 rabbit.evaluation_queue)
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(_consume_vectorization(vectorize, vectorizer))
+            tasks.create_task(_consume_recommendations(recommend, rabbit, recommendation_exchange, store, catalogue))
             tasks.create_task(_consume_evaluations(evaluate, settings, exchange))
     finally:
         await connection.close()
+        store.close()
         vectorizer.close()

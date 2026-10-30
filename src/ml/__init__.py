@@ -28,6 +28,14 @@ def main() -> None:
     vectorize.add_argument("--skip-existing", action="store_true",
                            help="skip games that already have a vector with the current text version")
 
+    index_text = commands.add_parser("index-text", help="fill the keyword (BM25) search index, no model needed")
+    target = index_text.add_mutually_exclusive_group(required=True)
+    target.add_argument("--limit", type=int, help="first N games by id")
+    target.add_argument("--ids", type=_parse_ids, help="comma-separated game ids")
+    target.add_argument("--all", action="store_true", help="every game (minutes)")
+    index_text.add_argument("--skip-existing", action="store_true",
+                            help="skip games whose indexed text is unchanged")
+
     stale = commands.add_parser("stale", help="list games whose vector is out of date (nothing is vectorized)")
     stale.add_argument("--limit", type=int, default=30, help="rows to print (default 30)")
     stale.add_argument("--reason", action="append",
@@ -95,6 +103,16 @@ def main() -> None:
             from ml.vectorize import run_bulk
 
             run_bulk(settings, ids=args.ids, limit=None if args.all else args.limit, skip_existing=args.skip_existing)
+        case "index-text":
+            from ml.db import GameRepository
+            from ml.text_index import run_index
+
+            games = GameRepository(settings.database)
+            try:
+                run_index(settings.milvus, games, ids=args.ids, limit=None if args.all else args.limit,
+                          skip_existing=args.skip_existing)
+            finally:
+                games.close()
         case "stale":
             from ml.staleness import print_report
 

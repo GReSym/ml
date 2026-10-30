@@ -12,9 +12,21 @@ from ml.config import ModelSettings
 log = logging.getLogger(__name__)
 
 
+# Qwen3-Embedding is instruction-aware: queries take a one-sentence task, documents none. FastEmbed doesn't add it
+QUERY_INSTRUCTION = "Given a description of a video game a player wants, retrieve games that match it"
+
+
+def query_prompt(query: str) -> str:
+    return f"Instruct: {QUERY_INSTRUCTION}\nQuery:{query}"
+
+
 class Embedder(Protocol):
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Game texts are documents: no instruction prompt. Output is L2-normalized."""
+        ...
+
+    def embed_query(self, query: str) -> list[float]:
+        """A search query, with the instruction prompt. Output is L2-normalized."""
         ...
 
 
@@ -49,6 +61,9 @@ class OnnxEmbedder:
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [vector.tolist() for vector in self._model.embed(texts, batch_size=self._batch_size)]
+
+    def embed_query(self, query: str) -> list[float]:
+        return self.embed_documents([query_prompt(query)])[0]
 
 
 class TorchEmbedder:
@@ -90,3 +105,6 @@ class TorchEmbedder:
             show_progress_bar=False,
         )
         return embeddings.tolist()
+
+    def embed_query(self, query: str) -> list[float]:
+        return self.embed_documents([query_prompt(query)])[0]

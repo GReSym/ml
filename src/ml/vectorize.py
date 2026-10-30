@@ -11,6 +11,7 @@ from ml.db import GameRepository, GameText, ReviewRow
 from ml.embedder import create_embedder
 from ml.reviews import SelectedReview, positive_share, reviews_weight, select_reviews
 from ml.text import TEXT_VERSION, build_game_text, text_hash
+from ml.text_index import GameTextStore, build_text_row
 from ml.vectors import GameVector, GameVectorStore
 
 log = logging.getLogger(__name__)
@@ -64,10 +65,14 @@ class Vectorizer:
         self.games = GameRepository(settings.database)
         self.store = GameVectorStore(settings.milvus, settings.model)
         self.store.ensure_collection()
+        # The keyword index is kept in sync with the vectors (it's cheap: Milvus builds BM25 from the text)
+        self.texts = GameTextStore(settings.milvus)
+        self.texts.ensure_collection()
         self._embedder = create_embedder(settings.model)
 
     def vectorize(self, ids: list[int]) -> VectorizeResult:
-        """Idempotent: re-vectorizing a game overwrites its vector. Games missing in MariaDB are removed from Milvus."""
+        """Idempotent: re-vectorizing a game overwrites its vector and its keyword index row.
+        Games missing in MariaDB are removed from both."""
         games = self.games.get_games(ids)
         found = {game.id for game in games}
         missing = [game_id for game_id in ids if game_id not in found]
@@ -76,7 +81,9 @@ class Vectorizer:
             reviews = self.games.get_reviews(sorted(found))
             inputs = [build_input(game, reviews.get(game.id, []), self._reviews) for game in games]
             self.store.upsert([self._embed(item) for item in inputs])
+            self.texts.upsert([build_text_row(game) for game in games])
         self.store.delete(missing)
+        self.texts.delete(missing)
 
         return VectorizeResult(upserted=sorted(found), deleted=missing)
 
@@ -104,6 +111,7 @@ class Vectorizer:
     def close(self) -> None:
         self.games.close()
         self.store.close()
+        self.texts.close()
 
 
 def run_bulk(settings: Settings, ids: list[int] | None, limit: int | None, skip_existing: bool, chunk: int = 32) -> None:
