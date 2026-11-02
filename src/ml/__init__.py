@@ -70,6 +70,8 @@ def main() -> None:
     export = commands.add_parser("export", help="back up the game vectors from Milvus into an .npz file")
     export.add_argument("--out", type=Path, help="target file (default milvus-<collection>-<date>.npz)")
     export.add_argument("--collection", help="collection to export (default milvus.collection)")
+    export.add_argument("--chunk-size", type=int, default=20_000,
+                        help="rows per chunk: the export and the import hold one chunk in memory (default 20000)")
 
     restore = commands.add_parser("import", help="restore game vectors from an `ml export` file into Milvus")
     restore.add_argument("file", type=Path)
@@ -153,7 +155,7 @@ def main() -> None:
 
             try:
                 if args.command == "export":
-                    export_vectors(settings, args.out, args.collection)
+                    export_vectors(settings, args.out, args.collection, args.chunk_size)
                 else:
                     import_vectors(settings, args.file, args.collection, overwrite=args.yes)
             except BackupError as e:
