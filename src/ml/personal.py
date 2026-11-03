@@ -23,6 +23,10 @@ class RatingDto(CamelModel):
 
 class RecommendationsRequest(CamelModel):
     ratings: list[RatingDto] = Field(max_length=5000)
+    # The user's planned / rejected games: weak likes / dislikes (±rec.LIST_WEIGHT), never recommended.
+    # Ignored for games that are in `ratings` too
+    planned: list[int] = Field(default_factory=list, max_length=5000)
+    rejected: list[int] = Field(default_factory=list, max_length=5000)
     limit: int = Field(default=20, ge=1, le=100)
     # 0 = pure similarity (the most niche games), 100 = strongly favours popular games; None = the default
     mainstream: int | None = Field(default=None, ge=0, le=100)
@@ -52,6 +56,12 @@ def scored(items: list[tuple[int, float]]) -> list[ScoredGameDto]:
 def recommend(store: GameVectorStore, stats: CatalogueStats, request: RecommendationsRequest) -> RecommendationsResponse:
     """Blocking (Milvus searches): call it from a thread."""
     ratings = [rec.Rating(r.game_id, r.rating, r.recommend) for r in request.ratings]
+    rated = {r.game_id for r in request.ratings}
+    for ids, weight in ((request.planned, rec.LIST_WEIGHT), (request.rejected, -rec.LIST_WEIGHT)):
+        for game_id in dict.fromkeys(ids):  # dedup, keeps the order
+            if game_id not in rated:
+                rated.add(game_id)
+                ratings.append(rec.Rating(game_id, weight=weight))
     mainstream = rec.DEFAULT_MAINSTREAM if request.mainstream is None else request.mainstream
     dislike_mode = request.dislike_mode or rec.DEFAULT_USER_DISLIKE_MODE
     dislike_strength = rec.DEFAULT_DISLIKE_STRENGTH if request.dislike_strength is None else request.dislike_strength

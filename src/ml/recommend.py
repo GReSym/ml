@@ -27,6 +27,9 @@ DEFAULT_MAINSTREAM = 10
 MAX_BETA = 0.5
 # Most popular games (the user hasn't rated) added to the kNN candidates when β > 0
 POPULAR_CANDIDATES = 1000
+# |Weight| of the user's planned (+) / rejected (−) games (backend `user_game_lists`): weak likes / dislikes, half a full
+# like (rating 10 or recommend = ±1). Only relative weights matter, so a user with planned games only gets full kNN results
+LIST_WEIGHT = 0.5
 
 # How disliked games change the kNN ranking (docs/evaluation.md, "Disliked games"):
 # - centroid: score −= λ·cos(game, weighted mean of the dislikes)
@@ -83,6 +86,7 @@ class Rating:
     game_id: int
     rating: int | None = None
     recommend: bool | None = None
+    weight: float | None = None  # explicit weight in [-1, 1] (planned / rejected games), wins over rating and recommend
 
 
 @dataclass
@@ -92,7 +96,9 @@ class Recommendations:
 
 
 def rating_weight(rating: Rating) -> float:
-    """Maps a rating to [-1, 1]: 10 → 1, 1 → -1, 5.5 → 0. Falls back to recommend (±1)."""
+    """Maps a rating to [-1, 1]: 10 → 1, 1 → -1, 5.5 → 0. Falls back to recommend (±1). An explicit weight wins."""
+    if rating.weight is not None:
+        return rating.weight
     if rating.rating is not None:
         middle = (RATING_MIN + RATING_MAX) / 2
         return (rating.rating - middle) / (RATING_MAX - middle)
