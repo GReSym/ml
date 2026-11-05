@@ -36,6 +36,10 @@ class MilvusSettings(BaseModel):
     token: str = ""
     collection: str
     text_collection: str  # BM25 index of titles and descriptions (ml.text_index)
+    # Transient gRPC/connection errors (dropped stream, `Connection reset by peer`, server restart) are retried
+    # with exponential backoff — see GameVectorStore._retry (writes, ml import/export bookkeeping).
+    retry_attempts: int = Field(default=6, ge=1)  # total tries per operation, ~62 s of tolerated downtime at the defaults
+    retry_backoff: float = Field(default=2.0, ge=0.1)  # seconds before the first retry, doubled up to 60
 
 
 class RabbitMqSettings(BaseModel):

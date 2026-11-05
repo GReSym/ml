@@ -7,10 +7,12 @@ reviews, so the review weight can be retuned without re-embedding) and a snapsho
 
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from typing import TypeVar
 
-from pymilvus import DataType, MilvusClient
+import grpc
+from pymilvus import DataType, MilvusClient, MilvusException
 
 from ml.config import MilvusSettings, ModelSettings
 
@@ -20,6 +22,9 @@ VECTOR_FIELD = "embedding"
 DESC_VECTOR_FIELD = "desc_embedding"
 REVIEWS_VECTOR_FIELD = "reviews_embedding"
 MAX_REVIEW_IDS = 64  # ARRAY capacity, also the upper limit of reviews.max_selected
+MAX_RETRY_BACKOFF = 60.0  # seconds, cap of the doubling backoff between Milvus retries
+RETRYABLE = (MilvusException, grpc.RpcError)  # transient gRPC/connection errors: dropped stream, server restart
+T = TypeVar("T")
 
 # Snapshot fields, read by the staleness scan (no vectors)
 SNAPSHOT_FIELDS = ["id", "text_version", "updated_at", "desc_hash", "review_ids", "steam_reviews_total",
@@ -53,6 +58,7 @@ class VectorSnapshot:
 
 class GameVectorStore:
     def __init__(self, settings: MilvusSettings, model: ModelSettings) -> None:
+        self._settings = settings
         self._client = MilvusClient(uri=settings.uri, token=settings.token)
         self._collection = settings.collection
         self._model = model
@@ -61,8 +67,43 @@ class GameVectorStore:
     def collection(self) -> str:
         return self._collection
 
+    def _reset_client(self) -> None:
+        """Makes a brand-new MilvusClient. A dropped gRPC stream can leave the old channel unrecoverable —
+        pymilvus's own recovery (`connection_manager._recover`) then keeps failing, as seen during long imports —
+        so every retry must start from a fresh client. Best effort: if the server is still down, creating the
+        client doesn't connect eagerly and the next operation attempt fails, letting the retry loop continue."""
+        try:
+            self._client.close()
+        except Exception:
+            log.debug("Closing the old Milvus client failed", exc_info=True)
+        try:
+            self._client = MilvusClient(uri=self._settings.uri, token=self._settings.token)
+        except Exception:
+            log.debug("Recreating the Milvus client failed", exc_info=True)
+
+    def _retry(self, description: str, operation: Callable[[], T]) -> T:
+        """Runs one Milvus operation, retrying transient connection errors with exponential backoff
+        (milvus.retry_attempts tries, milvus.retry_backoff seconds before the first retry, doubling
+        up to MAX_RETRY_BACKOFF). Long imports randomly lose the gRPC stream — `Stream removed (Socket
+        closed)` / `Connection reset by peer` — and no longer have to be launched from scratch."""
+        delay = self._settings.retry_backoff
+        for attempt in range(1, self._settings.retry_attempts + 1):
+            try:
+                return operation()
+            except RETRYABLE as e:
+                if attempt >= self._settings.retry_attempts:
+                    raise
+                log.warning("%s failed (attempt %d of %d): %s — retrying in %.0f s",
+                            description, attempt, self._settings.retry_attempts, e, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, MAX_RETRY_BACKOFF)
+                self._reset_client()
+
     def ensure_collection(self) -> None:
         """Creates the collection if missing, checks the dimension and the schema, and loads it."""
+        self._retry(f"ensure_collection({self._collection})", self._ensure_collection)
+
+    def _ensure_collection(self) -> None:
         if not self._client.has_collection(self._collection):
             self._create_collection()
             return
@@ -141,7 +182,8 @@ class GameVectorStore:
             }
             for v in vectors
         ]
-        self._client.upsert(self._collection, data=rows)
+        self._retry(f"upsert of {len(rows)} rows into {self._collection}",
+                    lambda: self._client.upsert(self._collection, data=rows))
 
     def exists(self) -> bool:
         return self._client.has_collection(self._collection)
@@ -161,7 +203,8 @@ class GameVectorStore:
     def upsert_rows(self, rows: list[dict]) -> None:
         """Rows exactly as given (ml.backup restore keeps updated_at and the snapshot fields)."""
         if rows:
-            self._client.upsert(self._collection, data=rows)
+            self._retry(f"upsert of {len(rows)} rows into {self._collection}",
+                        lambda: self._client.upsert(self._collection, data=rows))
 
     def delete(self, ids: list[int]) -> None:
         if ids:
@@ -231,10 +274,13 @@ class GameVectorStore:
         return [[(hit["id"], float(hit["distance"])) for hit in hits] for hits in result]
 
     def count(self) -> int:
-        rows = self._client.query(
-            self._collection, filter="", output_fields=["count(*)"], consistency_level="Strong"
-        )
-        return int(rows[0]["count(*)"])
+        def _count() -> int:
+            rows = self._client.query(
+                self._collection, filter="", output_fields=["count(*)"], consistency_level="Strong"
+            )
+            return int(rows[0]["count(*)"])
+
+        return self._retry(f"count({self._collection})", _count)
 
     def close(self) -> None:
         self._client.close()

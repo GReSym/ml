@@ -10,7 +10,9 @@
     "uri": "http://localhost:19530",
     "token": "",
     "collection": "games_qwen3_06b_v2",
-    "text_collection": "games_text_v1"
+    "text_collection": "games_text_v1",
+    "retry_attempts": 6,
+    "retry_backoff": 2.0
   },
   "rabbitmq": {
     "host": "localhost",
