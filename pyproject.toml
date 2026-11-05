@@ -26,8 +26,8 @@ ml = "ml:main"
 requires = ["uv_build>=0.12.23,<0.13.0"]
 build-backend = "uv_build"
 
-# uv.lock always pins the CPU build. A ROCm/CUDA torch is swapped in at Docker build time (TORCH_BACKEND in
-# deploy/.env) without locking: nightly GPU wheels are deleted from the index after a few weeks.
+# uv.lock always pins the CPU build. A ROCm/CUDA torch is swapped in (pinned by TORCH_VERSION) when building the
+# gresym/ml-torch base image (deploy/manage.sh build-torch) without locking: nightly GPU wheels are deleted from the index after a few weeks.
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"

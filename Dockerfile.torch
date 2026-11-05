@@ -1,0 +1,58 @@
+# ML base image: gresym/ml-torch:<tag> (cpu | rocm-<version> | cuda-<version>), built by ../deploy/manage.sh
+# build-torch (also auto-built by `up --app` when the tag is missing). Everything heavy that changes rarely:
+# python + uv + the locked environment (uv sync) + apt libs + the GPU torch swap (the ROCm layer is ~18 GB).
+# Being a tagged *image* (not just build cache) is the point: image layers survive `docker builder prune` /
+# BuildKit GC, so ml/Dockerfile (the thin app image on top) rebuilds in seconds and never re-downloads torch.
+# The GPU torch version is PINNED via TORCH_VERSION: the pytorch indexes move with every release (an unpinned
+# `uv pip install torch` would silently pick a new ~3.5 GB wheel and kill the cache), so upgrades are explicit:
+# TORCH_VERSION=<v> ./manage.sh build-torch (see deploy/manage.sh).
+
+FROM python:3.14-slim
+COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0 \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    HF_HUB_OFFLINE=1 \
+    HF_HOME=/tmp/huggingface \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Dependencies first (uv.lock pins the CPU torch), cached until uv.lock changes
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-dev --no-install-project
+
+# libatomic1: the ROCm torch wheel imports libatomic, which python:3.14-slim lacks (worker crashed on `import torch`).
+# libnuma1: a runtime dependency of the ROCm stack. It does NOT silence the "E-001h rocSHMEM Could not open libnuma"
+# startup warning (verified 2026-10-24; probably wants the unversioned libnuma.so) — the warning is harmless and
+# left as is, see docs/known-issues.md.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libatomic1 libnuma1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# GPU builds replace the locked CPU torch with a pinned build from TORCH_INDEX_URL (set by deploy/manage.sh setup
+# from TORCH_BACKEND; stable indexes https://download.pytorch.org/whl/rocm7.14 / cu132). The wheel is not pinned
+# in uv.lock: each torch/ROCm release moves it, so the index in deploy/manage.sh has to be revisited when a newer
+# torch is wanted (TORCH_INDEX_URL=<url> ./manage.sh setup overrides it without editing manage.sh).
+# The rest of the environment stays as locked; torch's own GPU dependencies (triton, nvidia-*/rocm-*) come from the same index.
+# Uninstall first: otherwise uv keeps the installed CPU torch as satisfying "torch". `--index` (not --index-url) gives the
+# torch index priority over PyPI, which also has torch (with CUDA) and would win under uv's first-index strategy.
+# TORCH_VERSION pins the exact release (e.g. 2.14.1): `==2.14.1` matches the `2.14.1+rocm7.14` local-version wheel.
+# UV_COMPILE_BYTECODE=0 here: byte-compiling the ~18 GB ROCm stack (mostly native libs) buys nothing and costs
+# minutes on a rebuild; it is re-enabled for the smaller steps in ml/Dockerfile.
+ARG TORCH_BACKEND=cpu
+ARG TORCH_INDEX_URL=
+ARG TORCH_VERSION=
+ENV UV_COMPILE_BYTECODE=0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$TORCH_BACKEND" != "cpu" ]; then \
+        [ -n "$TORCH_INDEX_URL" ] || { echo "TORCH_INDEX_URL is required for TORCH_BACKEND=$TORCH_BACKEND"; exit 1; }; \
+        [ -n "$TORCH_VERSION" ] || { echo "TORCH_VERSION is required for TORCH_BACKEND=$TORCH_BACKEND"; exit 1; }; \
+        uv pip uninstall --python /app/.venv/bin/python torch \
+        && uv pip install --python /app/.venv/bin/python --prerelease allow --index "$TORCH_INDEX_URL" "torch==${TORCH_VERSION}"; \
+    fi \
+    && /app/.venv/bin/python -c "import torch; print('torch', torch.__version__, 'hip', torch.version.hip, 'cuda', torch.version.cuda)"

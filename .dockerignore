@@ -2,6 +2,8 @@
 .git/
 **/__pycache__/
 Qwen3-Embedding/
+Qwen3-Embedding-onnx/
+data/
 milvus/
 config.json
 *.npz
