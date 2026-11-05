@@ -5,6 +5,9 @@ import sys
 from pathlib import Path
 
 
+MAX_ID = 2**31 - 1  # games.id is INT
+
+
 def _parse_ids(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part.strip()]
 
@@ -33,6 +36,8 @@ def main() -> None:
     target.add_argument("--limit", type=int, help="first N games by id")
     target.add_argument("--ids", type=_parse_ids, help="comma-separated game ids")
     target.add_argument("--all", action="store_true", help="every game (minutes)")
+    target.add_argument("--from", dest="from_id", type=int, help="games with id >= N (with --to: an id range)")
+    index_text.add_argument("--to", dest="to_id", type=int, default=MAX_ID, help="last game id of the --from range")
     index_text.add_argument("--skip-existing", action="store_true",
                             help="skip games whose indexed text is unchanged")
 
@@ -72,6 +77,9 @@ def main() -> None:
     export.add_argument("--collection", help="collection to export (default milvus.collection)")
     export.add_argument("--chunk-size", type=int, default=20_000,
                         help="rows per chunk: the export and the import hold one chunk in memory (default 20000)")
+    export.add_argument("--from", dest="from_id", type=int,
+                        help="only games with id >= N (a partial export, e.g. new games for another machine)")
+    export.add_argument("--to", dest="to_id", type=int, help="only games with id <= M")
 
     restore = commands.add_parser("import", help="restore game vectors from an `ml export` file into Milvus")
     restore.add_argument("file", type=Path)
@@ -111,7 +119,10 @@ def main() -> None:
 
             games = GameRepository(settings.database)
             try:
-                run_index(settings.milvus, games, ids=args.ids, limit=None if args.all else args.limit,
+                ids = args.ids
+                if args.from_id is not None:
+                    ids = games.get_game_ids_in_range(args.from_id, args.to_id)
+                run_index(settings.milvus, games, ids=ids, limit=None if args.all else args.limit,
                           skip_existing=args.skip_existing)
             finally:
                 games.close()
@@ -155,7 +166,11 @@ def main() -> None:
 
             try:
                 if args.command == "export":
-                    export_vectors(settings, args.out, args.collection, args.chunk_size)
+                    id_range = None
+                    if args.from_id is not None or args.to_id is not None:
+                        id_range = (args.from_id if args.from_id is not None else 0,
+                                    args.to_id if args.to_id is not None else MAX_ID)
+                    export_vectors(settings, args.out, args.collection, args.chunk_size, id_range)
                 else:
                     import_vectors(settings, args.file, args.collection, overwrite=args.yes)
             except BackupError as e:

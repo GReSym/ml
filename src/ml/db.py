@@ -159,6 +159,12 @@ class GameRepository:
             cursor.execute(sql, params)
             return [row["id"] for row in cursor.fetchall()]
 
+    def get_game_ids_in_range(self, low: int, high: int) -> list[int]:
+        """Ids of the games with low <= id <= high, ascending."""
+        with self._connect().cursor() as cursor:
+            cursor.execute("SELECT id FROM games WHERE id BETWEEN %s AND %s ORDER BY id", (low, high))
+            return [row["id"] for row in cursor.fetchall()]
+
     def get_steam_app_ids(self) -> dict[int, int]:
         """Steam app id → game id for every game from Steam."""
         with self._connect().cursor() as cursor:

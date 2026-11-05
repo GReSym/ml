@@ -146,11 +146,11 @@ class GameVectorStore:
     def exists(self) -> bool:
         return self._client.has_collection(self._collection)
 
-    def raw_rows(self, fields: list[str], batch_size: int = 500) -> Iterator[list[dict]]:
-        """Every row as stored, in batches (used by ml.backup)."""
+    def raw_rows(self, fields: list[str], batch_size: int = 500, filter: str = "") -> Iterator[list[dict]]:
+        """Every row as stored (or only those matching `filter`), in batches (used by ml.backup)."""
         self._client.load_collection(self._collection)
         iterator = self._client.query_iterator(
-            self._collection, batch_size=batch_size, filter="", output_fields=fields, consistency_level="Strong",
+            self._collection, batch_size=batch_size, filter=filter, output_fields=fields, consistency_level="Strong",
         )
         try:
             while rows := iterator.next():

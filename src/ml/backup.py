@@ -9,6 +9,9 @@ so neither side ever holds more than one chunk in memory (a whole catalogue as P
 Layout: per chunk, one array per field named "chunkNNNNN.<field>": review_ids flattened with offsets local to the chunk,
 reviews_embedding with a has_reviews mask (zeros where the game has no reviews). A JSON "meta" entry (collection, model,
 dimension, TEXT_VERSION, rows, chunks, ...) is written last. Format 1 (everything in one unprefixed chunk) is still readable.
+
+A partial export (`id_range` in meta, `ml export --from/--to`) holds only the games in that id range. It's for moving freshly parsed
+games to another machine together with `backend/manage.sh database dump-games`; importing it only upserts those ids.
 """
 
 import json
@@ -95,12 +98,21 @@ def _write_array(archive: zipfile.ZipFile, name: str, array: np.ndarray) -> None
 
 
 def export_vectors(settings: Settings, out: Path | None, collection: str | None = None,
-                   chunk_size: int = CHUNK_SIZE) -> Path:
+                   chunk_size: int = CHUNK_SIZE, id_range: tuple[int, int] | None = None) -> Path:
+    """Every vector of the collection, or only the games with id_range[0] <= id <= id_range[1]."""
     store = _store(settings, collection)
     try:
         if not store.exists():
             raise BackupError(f"Collection {store.collection} doesn't exist")
-        out = out or Path(f"milvus-{store.collection}-{datetime.now():%Y%m%dT%H%M}.npz")
+        id_filter = ""
+        part = ""
+        if id_range is not None:
+            low, high = id_range
+            if low > high:
+                raise BackupError(f"Empty id range {low}..{high}")
+            id_filter = f"id >= {int(low)} and id <= {int(high)}"
+            part = f"-ids{low}-{high}"
+        out = out or Path(f"milvus-{store.collection}{part}-{datetime.now():%Y%m%dT%H%M}.npz")
         if out.exists():
             raise BackupError(f"{out} already exists")
 
@@ -121,7 +133,7 @@ def export_vectors(settings: Settings, out: Path | None, collection: str | None 
 
         try:
             with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-                for rows in store.raw_rows(ALL_FIELDS, BATCH_SIZE):
+                for rows in store.raw_rows(ALL_FIELDS, BATCH_SIZE, filter=id_filter):
                     if not rows:
                         continue
                     pending.append(_to_arrays(rows, dim))
@@ -141,7 +153,11 @@ def export_vectors(settings: Settings, out: Path | None, collection: str | None 
                     "chunks": chunks,
                     "exported_at": int(time.time()),
                 }
+                if id_range is not None:
+                    meta["id_range"] = list(id_range)
                 _write_array(archive, "meta", np.array(json.dumps(meta)))
+            if id_range is not None and count == 0:
+                raise BackupError(f"No vectors with id in {id_range[0]}..{id_range[1]}")
             os.replace(tmp, out)
         except BaseException:
             tmp.unlink(missing_ok=True)
@@ -194,7 +210,11 @@ def import_vectors(settings: Settings, source: Path, collection: str | None = No
         try:
             store.ensure_collection()
             existing = store.count()
-            if existing and not overwrite:
+            id_range = meta.get("id_range")
+            if id_range:
+                # Partial export: only these ids are upserted, the rest of the collection stays as it is
+                log.info("Partial backup: %d vectors for game ids %d..%d", meta["rows"], *id_range)
+            elif existing and not overwrite:
                 raise BackupError(f"Collection {store.collection} already has {existing} vectors. "
                                   "Rows with the same id are replaced, others are kept. Pass --yes to continue")
 
