@@ -43,7 +43,7 @@
     "recommendation_results_routing_key": "recommendation.result"
   },
   "model": {
-    "name": "onnx-community/embeddinggemma-300m-ONNX",
+    "name": "google/embeddinggemma-300m",
     "backend": "onnx",
     "path": "models/embeddinggemma-300m",
     "onnx_path": "models/embeddinggemma-300m-onnx",
