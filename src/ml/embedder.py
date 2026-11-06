@@ -1,7 +1,7 @@
-"""Qwen3-Embedding: ONNX Runtime via FastEmbed on CPU (default), or Sentence Transformers on torch (model.backend).
+"""Model-agnostic embedding interface: ONNX Runtime via FastEmbed or Sentence Transformers on torch.
 
-Both backends produce the same vectors (cosine 1.00000 on 278 texts, fp32), so vectors from either can be mixed.
-The ONNX backend is ~1.55x faster on CPU with ~30% less RAM; torch is what runs on a GPU (CUDA/ROCm).
+The ONNX backend uses FastEmbed; torch uses Sentence Transformers. Both support CPU inference, and torch supports
+GPU inference (CUDA/ROCm).
 """
 
 import logging
@@ -12,21 +12,13 @@ from ml.config import ModelSettings
 log = logging.getLogger(__name__)
 
 
-# Qwen3-Embedding is instruction-aware: queries take a one-sentence task, documents none. FastEmbed doesn't add it
-QUERY_INSTRUCTION = "Given a description of a video game a player wants, retrieve games that match it"
-
-
-def query_prompt(query: str) -> str:
-    return f"Instruct: {QUERY_INSTRUCTION}\nQuery:{query}"
-
-
 class Embedder(Protocol):
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Game texts are documents: no instruction prompt. Output is L2-normalized."""
+        """Game texts are documents. Output is L2-normalized."""
         ...
 
     def embed_query(self, query: str) -> list[float]:
-        """A search query, with the instruction prompt. Output is L2-normalized."""
+        """A search query. Output is L2-normalized."""
         ...
 
 
@@ -57,13 +49,16 @@ class OnnxEmbedder:
         # FastEmbed truncates at the tokenizer's model_max_length (32768) and has no option for it
         self._model.model.tokenizer.enable_truncation(max_length=settings.max_seq_length, direction="right")
         self._batch_size = settings.batch_size
+        self._query_prefix = settings.query_prefix
+        self._document_prefix = settings.document_prefix
         _check_dimension(self._model.embedding_size, settings)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [vector.tolist() for vector in self._model.embed(texts, batch_size=self._batch_size)]
+        inputs = [self._document_prefix + text for text in texts]
+        return [vector.tolist() for vector in self._model.embed(inputs, batch_size=self._batch_size)]
 
     def embed_query(self, query: str) -> list[float]:
-        return self.embed_documents([query_prompt(query)])[0]
+        return self.embed_documents([self._query_prefix + query])[0]
 
 
 class TorchEmbedder:
@@ -94,11 +89,13 @@ class TorchEmbedder:
         )
         self._model.max_seq_length = settings.max_seq_length
         self._batch_size = settings.batch_size
+        self._query_prefix = settings.query_prefix
+        self._document_prefix = settings.document_prefix
         _check_dimension(self._model.get_embedding_dimension(), settings)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         embeddings = self._model.encode(
-            texts,
+            [self._document_prefix + text for text in texts],
             batch_size=self._batch_size,
             normalize_embeddings=True,
             convert_to_numpy=True,
@@ -107,4 +104,12 @@ class TorchEmbedder:
         return embeddings.tolist()
 
     def embed_query(self, query: str) -> list[float]:
-        return self.embed_documents([query_prompt(query)])[0]
+        # Avoid routing through embed_documents: query and document prompts may differ.
+        embeddings = self._model.encode(
+            [self._query_prefix + query],
+            batch_size=self._batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return embeddings[0].tolist()

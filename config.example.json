@@ -9,7 +9,7 @@
   "milvus": {
     "uri": "http://localhost:19530",
     "token": "",
-    "collection": "games_qwen3_06b_v2",
+    "collection": "games_gemma_03b_v1",
     "text_collection": "games_text_v1",
     "retry_attempts": 6,
     "retry_backoff": 2.0
@@ -43,16 +43,18 @@
     "recommendation_results_routing_key": "recommendation.result"
   },
   "model": {
-    "name": "Qwen/Qwen3-Embedding-0.6B",
+    "name": "onnx-community/embeddinggemma-300m-ONNX",
     "backend": "onnx",
-    "path": "Qwen3-Embedding",
-    "onnx_path": "Qwen3-Embedding-onnx",
-    "dimension": 1024,
+    "path": "models/embeddinggemma-300m",
+    "onnx_path": "models/embeddinggemma-300m-onnx",
+    "dimension": 768,
     "max_seq_length": 1024,
     "batch_size": 1,
     "threads": null,
     "device": "cpu",
-    "dtype": "float32"
+    "dtype": "float32",
+    "query_prefix": "task: search result | query: ",
+    "document_prefix": ""
   },
   "reviews": {
     "max_selected": 8,

@@ -10,7 +10,7 @@ ML-сервис дипломного проекта **GReSym (Game Recommendatio
 
 ## Возможности
 
-- построение векторов игр моделью [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (работает на CPU);
+- построение векторов игр моделью [EmbeddingGemma 300M](https://huggingface.co/google/embeddinggemma-300m) (по умолчанию использует ONNX Runtime на CPU);
 - хранение векторов в Milvus (индекс HNSW, косинусное сходство);
 - массовая векторизация игр из командной строки (с продолжением после прерывания);
 - фоновая векторизация по запросам backend через RabbitMQ;
@@ -23,8 +23,8 @@ ML-сервис дипломного проекта **GReSym (Game Recommendatio
            MariaDB (только чтение)
                 │
                 │ название + описание игры
-                ▼
-RabbitMQ ──▶ ML worker ──▶ Qwen3-Embedding ──▶ Milvus
+                 ▼
+RabbitMQ ──▶ ML worker ──▶ EmbeddingGemma ──▶ Milvus
   ▲          (векторизация)                      │
   │ {gameId}                                     │ поиск ближайших
   │                                              ▼
@@ -88,8 +88,7 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 │   ├── recommend.py         # Алгоритм рекомендаций
 │   ├── api.py               # HTTP API (FastAPI)
 │   └── worker.py            # Обработчик очереди RabbitMQ
-├── Qwen3-Embedding/         # Файлы модели для torch (не в git, скачиваются отдельно)
-├── Qwen3-Embedding-onnx/    # ONNX-версия модели, используется по умолчанию (не в git)
+├── models/                  # Модели (не в git): embeddinggemma-300m/ и embeddinggemma-300m-onnx/
 ├── config.example.json      # Пример конфигурации (в git)
 ├── config.json              # Локальная конфигурация с секретами (не в git)
 ├── Dockerfile               # Образ для `ml api` и `ml worker` (собирается из ../deploy)
@@ -128,22 +127,22 @@ uv sync
 
 ### 2. Модель
 
-По умолчанию (`model.backend: onnx`) модель работает через ONNX Runtime на CPU. Её нужно скачать в каталог `Qwen3-Embedding-onnx/`:
+Модели хранятся в игнорируемом git каталоге `models/`. По умолчанию (`model.backend: onnx`) используется ONNX Runtime на CPU. ONNX-модель нужно скачать в `models/embeddinggemma-300m-onnx/`:
 
 ```bash
-uv run hf download Qdrant/Qwen3-Embedding-0.6B-onnx --include "onnx/model.onnx*" --include "*.json" --local-dir Qwen3-Embedding-onnx
+uv run hf download onnx-community/embeddinggemma-300m-ONNX --local-dir models/embeddinggemma-300m-onnx
 ```
 
-Для работы на GPU (`model.backend: torch`) нужна исходная модель в каталоге `Qwen3-Embedding/`:
+Для работы на GPU (`model.backend: torch`) нужна исходная модель в `models/embeddinggemma-300m/`:
 
 ```bash
-uv run hf download Qwen/Qwen3-Embedding-0.6B --local-dir Qwen3-Embedding
+uv run hf download google/embeddinggemma-300m --local-dir models/embeddinggemma-300m
 ```
 
 или через git (нужен `git-lfs`):
 
 ```bash
-git clone https://huggingface.co/Qwen/Qwen3-Embedding-0.6B Qwen3-Embedding
+git clone https://huggingface.co/google/embeddinggemma-300m models/embeddinggemma-300m
 ```
 
 ### 3. Milvus и RabbitMQ
@@ -186,11 +185,14 @@ Exchange и очереди RabbitMQ создаются автоматическ�
 |---|---|---|
 | `database.*` | `localhost:3306`, `GamesRecommend` | Подключение к MariaDB |
 | `milvus.uri` | `http://localhost:19530` | Адрес Milvus |
-| `milvus.collection` | `games_qwen3_06b_v2` | Коллекция с векторами игр |
+| `milvus.collection` | `games_gemma_03b_v1` | Коллекция с векторами игр |
 | `rabbitmq.*` | `localhost:5672`, `gresym.tasks`, `ml.vectorize-game` | Подключение и имена exchange/очередей (должны совпадать с backend) |
 | `rabbitmq.delivery_limit` | `5` | Число попыток обработки сообщения до перемещения в `ml.vectorize-game.dlq` |
-| `model.path` | `Qwen3-Embedding` | Путь к модели (относительно каталога репозитория) |
-| `model.dimension` | `1024` | Размерность векторов |
+| `model.path` | `models/embeddinggemma-300m` | Путь к модели для torch (относительно каталога репозитория) |
+| `model.onnx_path` | `models/embeddinggemma-300m-onnx` | Путь к ONNX-модели |
+| `model.dimension` | `768` | Размерность векторов |
+| `model.query_prefix` | `task: search result | query: ` | Префикс поискового запроса для EmbeddingGemma |
+| `model.document_prefix` | `title: none | text: ` | Префикс документов для EmbeddingGemma |
 | `model.max_seq_length` | `1024` | Максимальная длина текста в токенах (длинные тексты обрезаются) |
 | `model.batch_size` | `1` | Размер батча (на CPU 1 оказался быстрее 8) |
 | `model.threads` | `null` | Число потоков PyTorch (`null` — по умолчанию) |
@@ -257,7 +259,7 @@ uv run ml evaluate --test-selection random-liked --json report.json
 ### Docker
 
 Docker Compose для всего проекта находится в `../deploy` (MariaDB, RabbitMQ, Milvus, а в профиле `app` ещё API, `ml api` и `ml worker`).
-Образ собирается из `Dockerfile` в этом репозитории. Модель в образ не входит: каталоги `Qwen3-Embedding/` и `Qwen3-Embedding-onnx/` монтируются только для чтения.
+Образ собирается из `Dockerfile` в этом репозитории. Модель в образ не входит: выбранный каталог модели из `models/` монтируется только для чтения.
 
 ### Worker (очередь векторизации)
 
@@ -310,11 +312,10 @@ API не имеет аутентификации и по умолчанию сл
 
 ## Модель
 
-Используется **Qwen3-Embedding-0.6B** через Sentence Transformers:
+По умолчанию используется **EmbeddingGemma 300M** через ONNX Runtime (FastEmbed):
 
-- 0,6 млрд параметров, контекст до 32 тыс. токенов, векторы размерности 1024;
+- 300 млн параметров, векторы размерности 768;
 - поддержка более 100 языков, включая русский (описания игр в базе данных на русском);
-- описания игр векторизуются без инструкции (как документы).
+- описания игр векторизуются как документы, запросы используют префикс задачи retrieval.
 
-Модель хранится в формате bfloat16, но загружается в float32: на процессорах без аппаратной поддержки bf16
-(например, AMD Ryzen 5 5500U) это примерно в 4 раза быстрее. В памяти модель занимает около 2,4 ГБ.
+Для GPU можно переключить `model.backend` на `torch`; для этого скачайте исходную модель в каталог `model.path`.

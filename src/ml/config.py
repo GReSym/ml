@@ -84,6 +84,8 @@ class ModelSettings(BaseModel):
     threads: int | None = None
     device: str = "cpu"  # "cpu", "cuda" (also ROCm: torch exposes AMD GPUs as cuda) or "auto". onnx: cpu only
     dtype: Literal["float32", "float16", "bfloat16"] = "float32"  # torch only. fp32 on CPU: bf16 is ~4x slower there
+    query_prefix: str = ""  # prepended to queries for instruction/prompt-based embedding models
+    document_prefix: str = ""  # prepended to game descriptions and reviews when required by the model
 
     @property
     def resolved_path(self) -> Path:

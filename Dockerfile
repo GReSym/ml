@@ -3,7 +3,7 @@
 # gresym/ml-torch:<tag> image built from Dockerfile.torch by ../deploy/manage.sh build-torch (auto-built by
 # `up --app` when missing). Code changes rebuild this image in seconds, even after `docker builder prune`,
 # and never re-download torch. Rebuild the base (./manage.sh build-torch) only when uv.lock or TORCH_VERSION changes.
-# The model isn't baked in: compose mounts ml/Qwen3-Embedding and ml/Qwen3-Embedding-onnx under /models (read-only).
+# The model isn't baked in: compose mounts the configured local model directory under /models (read-only).
 # Configuration: config.example.json + GRESYM_ML__<SECTION>__<KEY> environment variables (see src/ml/config.py).
 
 # deploy/.env → TORCH_BASE_TAG (cpu | rocm-<version> | cuda-<version>), written by ../deploy/manage.sh setup
