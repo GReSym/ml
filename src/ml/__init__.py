@@ -28,9 +28,9 @@ def main() -> None:
     target.add_argument("--limit", type=int, help="first N games by id")
     target.add_argument("--ids", type=_parse_ids, help="comma-separated game ids")
     target.add_argument("--all", action="store_true", help="every game (hours on CPU)")
-    from_to_group = vectorize.add_argument_group("ID range from start to end (should provide both)")
-    from_to_group.add_argument("--start", type=int, help="first game id to vectorize (should be used with --to)")
-    from_to_group.add_argument("--end", type=int, help="last game id to vectorize (should be used with --start)")
+    start_end_group = vectorize.add_argument_group("ID range from start to end (should provide both)")
+    start_end_group.add_argument("--start", type=int, help="first game id to vectorize (should be used with --end)")
+    start_end_group.add_argument("--end", type=int, help="last game id to vectorize (should be used with --start)")
     vectorize.add_argument("--skip-existing", action="store_true",
                            help="skip games that already have a vector with the current text version")
 
