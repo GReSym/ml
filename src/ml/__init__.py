@@ -24,10 +24,13 @@ def main() -> None:
     commands.add_parser("worker", help="consume game vectorization requests from RabbitMQ")
 
     vectorize = commands.add_parser("vectorize", help="vectorize games directly (bulk)")
-    target = vectorize.add_mutually_exclusive_group(required=True)
+    target = vectorize.add_mutually_exclusive_group(required=False)
     target.add_argument("--limit", type=int, help="first N games by id")
     target.add_argument("--ids", type=_parse_ids, help="comma-separated game ids")
     target.add_argument("--all", action="store_true", help="every game (hours on CPU)")
+    from_to_group = vectorize.add_argument_group("ID range from start to end (should provide both)")
+    from_to_group.add_argument("--start", type=int, help="first game id to vectorize (should be used with --to)")
+    from_to_group.add_argument("--end", type=int, help="last game id to vectorize (should be used with --start)")
     vectorize.add_argument("--skip-existing", action="store_true",
                            help="skip games that already have a vector with the current text version")
 
@@ -112,7 +115,27 @@ def main() -> None:
         case "vectorize":
             from ml.vectorize import run_bulk
 
-            run_bulk(settings, ids=args.ids, limit=None if args.all else args.limit, skip_existing=args.skip_existing)
+            has_target = any([args.limit, args.ids, args.all])
+            has_range = args.start is not None or args.end is not None
+
+            # target or range
+            if not has_target and not has_range:
+                sys.exit("Provide either: --limit, --ids, --all or --start/--end")
+
+            # only range or target in one run
+            if has_target and has_range:
+                sys.exit("Can't use (--start/--or) with any of --limit, --ids, --all")
+
+            # provide valid range
+            if has_range and (args.start is None or args.end is None):
+                sys.exit("Provide valid range with --start and --end")
+
+            if has_range:
+                game_ids = list(range(args.start, args.end + 1))
+                run_bulk(settings, ids=game_ids, limit=None, skip_existing=args.skip_existing)
+            else:
+                limit_val = None if args.all else args.limit
+                run_bulk(settings, ids=args.ids, limit=limit_val, skip_existing=args.skip_existing)
         case "index-text":
             from ml.db import GameRepository
             from ml.text_index import run_index
