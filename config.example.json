@@ -58,7 +58,6 @@
   },
   "reviews": {
     "max_selected": 8,
-    "min_chars": 150,
     "max_chars": 600,
     "weight_max": 0.35
   },

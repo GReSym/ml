@@ -74,8 +74,6 @@ def select_reviews(reviews: list[ReviewRow], share: float | None, settings: Revi
     negative: list[tuple[tuple, SelectedReview]] = []
     for review in reviews:
         text = clean_review(review.content)
-        if len(text) < settings.min_chars:
-            continue
         key = text.casefold()
         if key in seen:
             continue

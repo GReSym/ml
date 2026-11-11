@@ -96,7 +96,6 @@ class ModelSettings(BaseModel):
 
 class ReviewSettings(BaseModel):
     max_selected: int = Field(ge=1, le=64)  # reviews embedded per game (also the Milvus array capacity limit)
-    min_chars: int  # shorter reviews ("10/10", "best game") say nothing about the game
     max_chars: int  # each review is cut to this many characters
     weight_max: float = Field(ge=0)  # α for a game with max_selected reviews
 
