@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from ml.config import Settings
+from ml.fusion import load_review_mean, save_review_mean
 from ml.text import TEXT_VERSION
 from ml.vectors import DESC_VECTOR_FIELD, REVIEWS_VECTOR_FIELD, VECTOR_FIELD, GameVectorStore
 
@@ -52,8 +53,20 @@ class BackupError(Exception):
 
 
 def _store(settings: Settings, collection: str | None) -> GameVectorStore:
-    milvus = settings.milvus if collection is None else settings.milvus.model_copy(update={"collection": collection})
-    return GameVectorStore(milvus, settings.model)
+    return GameVectorStore.from_settings(settings, collection)
+
+
+def _restore_review_mean(settings: Settings, mean: np.ndarray) -> None:
+    """Writes the backup's mean review vector to reviews.mean_path if it's missing there; a different one is an error
+    (the backup's vectors were centered with it, new games would be centered differently)."""
+    path = settings.reviews.mean_file
+    if path is None:
+        log.warning("The backup has a mean review vector, but reviews.mean_path isn't set: not restored")
+        return
+    if not path.exists():
+        save_review_mean(path, mean)
+    elif not np.allclose(load_review_mean(path), mean, atol=1e-6):
+        raise BackupError(f"{path} differs from the backup's mean review vector: move it away to restore the backup's")
 
 
 def _chunk_prefix(index: int) -> str:
@@ -67,7 +80,8 @@ def _to_arrays(rows: list[dict], dim: int) -> dict[str, np.ndarray]:
         name: np.asarray([row.get(name) for row in rows], dtype=dtype) for name, dtype in SCALAR_FIELDS.items()
     }
     for name in (VECTOR_FIELD, DESC_VECTOR_FIELD):
-        arrays[name] = np.asarray([row[name] for row in rows], dtype=np.float32).reshape(count, dim)
+        # The search vector is twice as wide with a concat fusion
+        arrays[name] = np.asarray([row[name] for row in rows], dtype=np.float32).reshape(count, -1)
     reviews = np.zeros((count, dim), dtype=np.float32)
     has_reviews = np.zeros(count, dtype=bool)
     for i, row in enumerate(rows):
@@ -148,6 +162,8 @@ def export_vectors(settings: Settings, out: Path | None, collection: str | None 
                     "collection": store.collection,
                     "model": settings.model.name,
                     "dimension": dim,
+                    "search_dimension": store.search_dimension,
+                    "fusion": settings.reviews.spec.name,
                     "text_version": TEXT_VERSION,
                     "rows": count,
                     "chunks": chunks,
@@ -155,6 +171,11 @@ def export_vectors(settings: Settings, out: Path | None, collection: str | None 
                 }
                 if id_range is not None:
                     meta["id_range"] = list(id_range)
+                # The frozen mean review vector of the rcenter fusions travels with the vectors it centered
+                mean_file = settings.reviews.mean_file
+                if settings.reviews.spec.centered and mean_file is not None and mean_file.exists():
+                    _write_array(archive, "review_mean", load_review_mean(mean_file))
+                    meta["review_mean"] = True
                 _write_array(archive, "meta", np.array(json.dumps(meta)))
             if id_range is not None and count == 0:
                 raise BackupError(f"No vectors with id in {id_range[0]}..{id_range[1]}")
@@ -201,6 +222,13 @@ def import_vectors(settings: Settings, source: Path, collection: str | None = No
                 f"Backup is for {meta['model']} (dim {meta['dimension']}), the config uses "
                 f"{settings.model.name} (dim {settings.model.dimension})"
             )
+        search_dimension = meta.get("search_dimension", meta["dimension"])
+        expected = settings.reviews.spec.search_dimension(settings.model.dimension)
+        if search_dimension != expected:
+            raise BackupError(
+                f"Backup's search vectors have dim {search_dimension} (fusion {meta.get('fusion', 'sum')}), the config's "
+                f"fusion {settings.reviews.spec.name} needs {expected}: import it with a matching reviews.fusion"
+            )
         if meta["text_version"] != TEXT_VERSION:
             log.warning("Backup was made with TEXT_VERSION %s, current is %s: `ml stale` will list these vectors "
                         "as outdated", meta["text_version"], TEXT_VERSION)
@@ -208,6 +236,8 @@ def import_vectors(settings: Settings, source: Path, collection: str | None = No
 
         store = _store(settings, collection)
         try:
+            if meta.get("review_mean"):
+                _restore_review_mean(settings, data["review_mean"])
             store.ensure_collection()
             existing = store.count()
             id_range = meta.get("id_range")

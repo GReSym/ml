@@ -166,7 +166,7 @@ def filter_items(items: list[StaleGame], reasons: Iterable[str] | None) -> list[
 
 
 def print_report(settings: Settings, limit: int, reasons: list[str] | None, ids_only: bool) -> None:
-    store = GameVectorStore(settings.milvus, settings.model)
+    store = GameVectorStore.from_settings(settings)
     games = GameRepository(settings.database)
     try:
         store.ensure_collection()

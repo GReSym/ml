@@ -74,6 +74,36 @@ def main() -> None:
     evaluate.add_argument("--niche-head", type=int, default=1000,
                           help="the niche metrics ignore hidden games among this many most popular (default 1000)")
     evaluate.add_argument("--json", type=Path, help="also write the full report (as stored by the API) to this file")
+    evaluate.add_argument("--cf", action="store_true", help="also evaluate collaborative filtering (cf-item, cf-ease) trained on the users")
+    evaluate.add_argument("--cf-lambda", type=float, default=200.0, help="EASE regularization λ (default 200)")
+    evaluate.add_argument("--fusion", type=lambda v: [s.strip() for s in v.split(",") if s.strip()],
+                          help="fusion sweep over the stored description/review vectors, in memory, exact search: "
+                               "comma-separated sum:a | rcenter:a | concat:a | rcenter-concat:a (the first is the reference)")
+    evaluate.add_argument("--vectors-cache-dir", type=Path, default=Path("data/eval-cache"),
+                          help="where --fusion keeps a local copy of the vector components, <collection>.npz (~1 GB)")
+    evaluate.add_argument("--refresh-vectors", action="store_true", help="re-read the components from Milvus (--fusion)")
+
+    judge = commands.add_parser("judge", help="LLM-judged evaluation of an `ml evaluate --json` report (OpenAI-compatible API)")
+    judge.add_argument("report", type=Path, help="report of ml evaluate --json (a --fusion sweep report works too)")
+    judge.add_argument("--strategies", type=lambda v: [s.strip() for s in v.split(",") if s.strip()],
+                       default=["gresym", "knn", "knn-hybrid-0.05", "knn-hybrid-0.2", "popular", "random"],
+                       help="strategies to judge (default gresym,knn,knn-hybrid-0.05,knn-hybrid-0.2,popular,random)")
+    judge.add_argument("--fusions", type=lambda v: [s.strip() for s in v.split(",") if s.strip()],
+                       help="fusion specs of a sweep report to judge (default all)")
+    judge.add_argument("--users", type=int, default=150, help="users sampled from the report (default 150)")
+    judge.add_argument("--k", type=int, default=10, help="judged list length (default 10)")
+    judge.add_argument("--seed", type=int, default=42)
+    judge.add_argument("--repeat-share", type=float, default=0.05, help="share of pooled pairs judged twice (stability)")
+    judge.add_argument("--no-calibrate", action="store_true", help="skip judging hidden/random/disliked games")
+    judge.add_argument("--cache", type=Path, default=Path("data/judge/cache.jsonl"), help="judgement cache (JSONL)")
+    judge.add_argument("--dry-run", action="store_true", help="print the pair count and one prompt, call nothing")
+    judge.add_argument("--json", type=Path, help="also write the full result to this file")
+
+    recombine = commands.add_parser("recombine", help="rebuild search vectors with the configured reviews.fusion into a "
+                                                     "new collection, from another collection's stored components (no model)")
+    recombine.add_argument("--from", dest="source", required=True, help="source collection (read only)")
+    recombine.add_argument("--to", dest="target", help="target collection (default milvus.collection)")
+    recombine.add_argument("--yes", action="store_true", help="overwrite a target that already has vectors")
 
     export = commands.add_parser("export", help="back up the game vectors from Milvus into an .npz file")
     export.add_argument("--out", type=Path, help="target file (default milvus-<collection>-<date>.npz)")
@@ -159,7 +189,9 @@ def main() -> None:
             from pydantic import ValidationError
 
             from ml.db import GameRepository
-            from ml.evaluation import EvaluationError, EvaluationParams, format_report, run_evaluation
+            from ml.evaluation import (
+                EvaluationError, EvaluationParams, format_fusion_report, format_report, run_evaluation, run_fusion_sweep,
+            )
             from ml.vectors import GameVectorStore
 
             try:
@@ -169,21 +201,42 @@ def main() -> None:
                     hybrid_betas=args.hybrid_betas, center=args.center, dislike_modes=args.dislike_modes,
                     dislike_lambdas=args.dislike_lambdas, dislike_betas=args.dislike_betas,
                     hidden_dislikes=args.hidden_dislikes, tags=args.tags, niche_head=args.niche_head,
+                    cf=args.cf, cf_lambda=args.cf_lambda,
                 )
             except ValidationError as e:
                 sys.exit(f"Invalid parameters: {e}")
             games = GameRepository(settings.database)
-            store = GameVectorStore(settings.milvus, settings.model)
+            store = GameVectorStore.from_settings(settings)
             try:
-                report = run_evaluation(params, store, games)
-            except EvaluationError as e:
+                if args.fusion:
+                    cache = args.vectors_cache_dir / f"{store.collection}.npz"
+                    report = run_fusion_sweep(params, store, games, args.fusion, settings.reviews.max_selected,
+                                              cache, args.refresh_vectors)
+                else:
+                    report = run_evaluation(params, store, games)
+            except (EvaluationError, ValueError) as e:
                 sys.exit(f"Error: {e}")
             finally:
                 games.close()
                 store.close()
-            print(format_report(report))
+            print(format_fusion_report(report) if args.fusion else format_report(report))
             if args.json:
                 args.json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        case "judge":
+            from ml.judge import JudgeError
+            from ml.judged import judge_command
+
+            try:
+                judge_command(settings, args)
+            except JudgeError as e:
+                sys.exit(f"Error: {e}")
+        case "recombine":
+            from ml.recombine import RecombineError, recombine
+
+            try:
+                recombine(settings, args.source, args.target, args.yes)
+            except (RecombineError, ValueError, FileNotFoundError) as e:
+                sys.exit(f"Error: {e}")
         case "export" | "import":
             from ml.backup import BackupError, export_vectors, import_vectors
 

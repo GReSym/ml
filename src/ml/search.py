@@ -81,7 +81,9 @@ class GameSearch:
         if not exact and settings.dense:
             embedder = self._get_embedder()
             if embedder is not None:
-                hits = self._vectors.search(embedder.embed_query(query), n, exclude_ids=[])
+                # With a concat fusion the query only meets the description half of the game vectors (ml.fusion)
+                query_vector = self._settings.reviews.spec.query(embedder.embed_query(query))
+                hits = self._vectors.search(query_vector, n, exclude_ids=[])
                 lists.append(([game_id for game_id, _ in hits], settings.dense_weight))
                 mode = "hybrid"
 

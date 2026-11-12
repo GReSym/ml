@@ -58,7 +58,7 @@ class HealthResponse(CamelModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    store = GameVectorStore(settings.milvus, settings.model)
+    store = GameVectorStore.from_settings(settings)
     store.ensure_collection()
     app.state.store = store
     texts = GameTextStore(settings.milvus)

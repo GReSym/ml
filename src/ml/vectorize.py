@@ -9,6 +9,7 @@ import numpy as np
 from ml.config import ReviewSettings, Settings
 from ml.db import GameRepository, GameText, ReviewRow
 from ml.embedder import create_embedder
+from ml.fusion import load_review_mean
 from ml.reviews import SelectedReview, positive_share, reviews_weight, select_reviews
 from ml.text import TEXT_VERSION, build_game_text, text_hash
 from ml.text_index import GameTextStore, build_text_row
@@ -50,11 +51,14 @@ def _normalize(vector: np.ndarray) -> np.ndarray:
     return vector / norm if norm > 0 else vector
 
 
-def combine(desc: np.ndarray, reviews: np.ndarray | None, weight: float) -> np.ndarray:
-    """normalize(v_desc + α·v_reviews). Both inputs are unit vectors."""
-    if reviews is None or weight == 0:
-        return desc
-    return _normalize(desc + weight * reviews)
+def review_mean_for(settings: Settings) -> np.ndarray | None:
+    """The frozen mean review vector when the configured fusion centers reviews (ml.fusion), else None."""
+    if not settings.reviews.spec.centered:
+        return None
+    path = settings.reviews.mean_file
+    if path is None:
+        raise ValueError(f"reviews.fusion={settings.reviews.fusion} needs reviews.mean_path")
+    return load_review_mean(path)
 
 
 class Vectorizer:
@@ -62,8 +66,10 @@ class Vectorizer:
 
     def __init__(self, settings: Settings) -> None:
         self._reviews = settings.reviews
+        self._fusion = settings.reviews.spec
+        self._review_mean = review_mean_for(settings)
         self.games = GameRepository(settings.database)
-        self.store = GameVectorStore(settings.milvus, settings.model)
+        self.store = GameVectorStore.from_settings(settings)
         self.store.ensure_collection()
         # The keyword index is kept in sync with the vectors (it's cheap: Milvus builds BM25 from the text)
         self.texts = GameTextStore(settings.milvus)
@@ -94,10 +100,11 @@ class Vectorizer:
             # Each review is its own document: short sequences are cheap on CPU and no review drowns the others
             embedded = np.asarray(self._embedder.embed_documents([r.text for r in item.reviews]), dtype=np.float32)
             reviews = _normalize(embedded.mean(axis=0))
-        weight = reviews_weight(len(item.reviews), self._reviews)
+        weight = reviews_weight(len(item.reviews), self._reviews) if reviews is not None else 0.0
+        embedding = self._fusion.fuse_one(desc, reviews, len(item.reviews), self._reviews.max_selected, self._review_mean)
         return GameVector(
             id=item.game.id,
-            embedding=combine(desc, reviews, weight).tolist(),
+            embedding=embedding.tolist(),
             desc_embedding=desc.tolist(),
             reviews_embedding=None if reviews is None else reviews.tolist(),
             reviews_weight=weight,

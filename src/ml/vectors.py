@@ -14,7 +14,8 @@ from typing import TypeVar
 import grpc
 from pymilvus import DataType, MilvusClient, MilvusException
 
-from ml.config import MilvusSettings, ModelSettings
+from ml.config import MilvusSettings, ModelSettings, Settings
+from ml.fusion import FusionSpec
 
 log = logging.getLogger(__name__)
 
@@ -57,11 +58,21 @@ class VectorSnapshot:
 
 
 class GameVectorStore:
-    def __init__(self, settings: MilvusSettings, model: ModelSettings) -> None:
+    def __init__(self, settings: MilvusSettings, model: ModelSettings, fusion: FusionSpec | None = None) -> None:
+        """`fusion` decides the dimension of the search vector (`embedding`): twice the model's for the concat fusions.
+        The description/review components always have the model's dimension."""
         self._settings = settings
         self._client = MilvusClient(uri=settings.uri, token=settings.token)
         self._collection = settings.collection
         self._model = model
+        self._fusion = fusion
+        self.search_dimension = fusion.search_dimension(model.dimension) if fusion else model.dimension
+
+    @classmethod
+    def from_settings(cls, settings: Settings, collection: str | None = None) -> GameVectorStore:
+        """The configured collection (or `collection`) with the configured fusion (reviews.fusion)."""
+        milvus = settings.milvus if collection is None else settings.milvus.model_copy(update={"collection": collection})
+        return cls(milvus, settings.model, settings.reviews.spec)
 
     @property
     def collection(self) -> str:
@@ -117,23 +128,25 @@ class GameVectorStore:
                 "Set milvus.collection to a new name"
             )
         dim = int(fields[VECTOR_FIELD]["params"]["dim"])
-        if dim != self._model.dimension:
+        if dim != self.search_dimension:
             raise ValueError(
-                f"Collection {self._collection} has dim={dim}, model.dimension={self._model.dimension}. "
-                "Use a new collection name for a different model/dimension"
+                f"Collection {self._collection} has dim={dim}, expected {self.search_dimension} "
+                f"(model.dimension={self._model.dimension}, reviews.fusion={self._fusion.kind if self._fusion else 'sum'}). "
+                "Use a new collection name for a different model/dimension/fusion (`ml recombine`)"
             )
         self._client.load_collection(self._collection)
 
     def _create_collection(self) -> None:
         dim = self._model.dimension
+        fusion = self._fusion.kind if self._fusion else "sum"
         schema = self._client.create_schema(
             auto_id=False,
             enable_dynamic_field=False,
-            description=f"Game embeddings, model {self._model.name}, dim {dim}",
+            description=f"Game embeddings, model {self._model.name}, dim {dim}, fusion {fusion}",
         )
         schema.add_field("id", DataType.INT64, is_primary=True, description="MariaDB games.id")
-        schema.add_field(VECTOR_FIELD, DataType.FLOAT_VECTOR, dim=dim,
-                         description="normalize(desc + reviews_weight * reviews), used for search")
+        schema.add_field(VECTOR_FIELD, DataType.FLOAT_VECTOR, dim=self.search_dimension,
+                         description=f"desc and reviews merged by ml.fusion ({fusion}), used for search")
         # Components are only read back by id, never searched: memory-mapped, so they don't take RAM
         schema.add_field(DESC_VECTOR_FIELD, DataType.FLOAT_VECTOR, dim=dim, mmap_enabled=True,
                          description="title + description")
@@ -243,6 +256,16 @@ class GameVectorStore:
                     )
         finally:
             iterator.close()
+
+    def ids_with_vectors(self, ids: list[int], batch_size: int = 5000) -> set[int]:
+        """Which of `ids` have a vector (ids only, no vectors transferred)."""
+        ids = list(ids)
+        found: set[int] = set()
+        for start in range(0, len(ids), batch_size):
+            chunk = ids[start:start + batch_size]
+            rows = self._client.query(self._collection, filter=f"id in {chunk}", output_fields=["id"])
+            found.update(int(row["id"]) for row in rows)
+        return found
 
     def get_vectors(self, ids: list[int], batch_size: int = 1000) -> dict[int, list[float]]:
         """In batches: a 1024-dim vector is 4 KB, so thousands of ids in one gRPC reply get too large."""

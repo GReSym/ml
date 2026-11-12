@@ -53,6 +53,16 @@ class SteamUserData:
 
 
 @dataclass(frozen=True)
+class GameCard:
+    """What the LLM judge sees of a game (ml.judge)."""
+    id: int
+    title: str
+    description: str  # HTML
+    release_year: int | None  # None for the 1970-01-01 placeholder
+    tags: list[str]  # most specific first (rarest in the catalogue)
+
+
+@dataclass(frozen=True)
 class EvaluationRunRow:
     id: int
     status: str
@@ -201,6 +211,30 @@ class GameRepository:
                     game_ids.append(game_id)
                     tag_ids.append(tag_id)
         return game_ids, tag_ids
+
+    def get_game_cards(self, ids: list[int]) -> dict[int, GameCard]:
+        """Title, description, release year and tags (rarest first) of the given games."""
+        if not ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(ids))
+        with self._connect().cursor() as cursor:
+            cursor.execute(f"SELECT id, title, description, release_date FROM games WHERE id IN ({placeholders})", ids)
+            games = cursor.fetchall()
+            cursor.execute(
+                "SELECT gt.game_id, t.name, f.n FROM game_tags gt JOIN tags t ON t.id = gt.tag_id "
+                "JOIN (SELECT tag_id, COUNT(*) AS n FROM game_tags GROUP BY tag_id) f ON f.tag_id = gt.tag_id "
+                f"WHERE gt.game_id IN ({placeholders}) ORDER BY gt.game_id, f.n, t.name",
+                ids,
+            )
+            tags: dict[int, list[str]] = {}
+            for row in cursor.fetchall():
+                tags.setdefault(row["game_id"], []).append(row["name"])
+        cards = {}
+        for row in games:
+            date = row["release_date"]
+            year = date.year if date is not None and date.year > 1970 else None
+            cards[row["id"]] = GameCard(row["id"], row["title"], row["description"] or "", year, tags.get(row["id"], []))
+        return cards
 
     def get_titles(self, ids: list[int]) -> dict[int, str]:
         if not ids:

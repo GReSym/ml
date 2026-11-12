@@ -42,11 +42,14 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 Вектор игры складывается из двух частей:
 
 - **описание**: текст `название + описание` (HTML удаляется);
-- **отзывы**: до 8 отзывов, отобранных по полезности (оценка Steam), длиной не менее 150 символов, с долей отрицательных,
-  соответствующей реальному соотношению отзывов игры в Steam. Каждый отзыв векторизуется отдельно, затем векторы усредняются.
+- **отзывы**: до 8 отзывов, отобранных по полезности (оценка Steam), с долей отрицательных, соответствующей реальному
+  соотношению отзывов игры в Steam. Каждый отзыв векторизуется отдельно, затем векторы усредняются.
 
-Итоговый вектор: `normalize(v_описание + α · v_отзывы)`, где вес `α` растёт с числом отзывов (до 0,35 при 8 отзывах).
-У игр без отзывов вектор совпадает с вектором описания. Обе части хранятся в Milvus отдельно.
+Итоговый вектор (`reviews.fusion = rcenter-concat`, с 2026-11-12): `normalize([v_описание, √w · normalize(v_отзывы − r̄)])`,
+где `w = 0,7 · min(1, отзывов / 8)`, а `r̄` — средний вектор отзывов каталога, зафиксированный в файле `reviews.mean_path`.
+Размерность вектора поиска 1536 (две половины по 768). Косинус двух игр = сходство описаний + сходство центрированных отзывов.
+У игр без отзывов вторая половина нулевая. Обе части хранятся в Milvus отдельно, поэтому способ объединения и вес меняются
+без модели: `ml recombine`. Почему так: `docs/evaluation.md` («Fusion sweep») и `docs/ml.md` («Fusion»).
 
 При изменении шаблона текста или правил отбора отзывов нужно увеличить `TEXT_VERSION` в `src/ml/text.py`
 и заново векторизовать игры.
@@ -74,13 +77,18 @@ Backend (ASP.NET) ──── HTTP POST /recommendations ──▶ ML API
 ```text
 .
 ├── src/ml/
-│   ├── __init__.py          # CLI: ml api | worker | vectorize | stale | evaluate | export | import
+│   ├── __init__.py          # CLI: ml api | worker | vectorize | index-text | stale | evaluate | judge | recombine | export | import
 │   ├── config.py            # Загрузка конфигурации
 │   ├── backup.py            # Резервная копия векторов (ml export / ml import)
 │   ├── db.py                # Чтение игр и отзывов из MariaDB
 │   ├── evaluation.py        # Офлайн-оценка рекомендаций (leave-k-out, базовые стратегии, метрики)
 │   ├── text.py              # Очистка HTML, шаблон текста игры, хэш текста
 │   ├── reviews.py           # Очистка и отбор отзывов, вес отзывов
+│   ├── fusion.py            # Объединение векторов описания и отзывов (sum / rcenter / concat / rcenter-concat)
+│   ├── recombine.py         # Пересборка коллекции с другим объединением без модели (ml recombine)
+│   ├── memstore.py          # Векторы в памяти и точный поиск для сравнения способов объединения (ml evaluate --fusion)
+│   ├── cf.py                # Базовые методы коллаборативной фильтрации для оценки: EASE, item-CF, популярность в сообществе (ml evaluate --cf)
+│   ├── judge.py, judged.py  # LLM-судья релевантности и метрики по его оценкам (ml judge)
 │   ├── embedder.py          # Модель эмбеддингов (ONNX Runtime через FastEmbed или Sentence Transformers)
 │   ├── vectors.py           # Коллекция Milvus: запись и поиск
 │   ├── vectorize.py         # Векторизация игр (в том числе массовая)
@@ -185,7 +193,7 @@ Exchange и очереди RabbitMQ создаются автоматическ�
 |---|---|---|
 | `database.*` | `localhost:3306`, `GamesRecommend` | Подключение к MariaDB |
 | `milvus.uri` | `http://localhost:19530` | Адрес Milvus |
-| `milvus.collection` | `games_gemma_03b_v1` | Коллекция с векторами игр |
+| `milvus.collection` | `games_gemma_03b_rc07` | Коллекция с векторами игр (одна коллекция = одна модель и один `reviews.fusion`) |
 | `rabbitmq.*` | `localhost:5672`, `gresym.tasks`, `ml.vectorize-game` | Подключение и имена exchange/очередей (должны совпадать с backend) |
 | `rabbitmq.delivery_limit` | `5` | Число попыток обработки сообщения до перемещения в `ml.vectorize-game.dlq` |
 | `model.path` | `models/embeddinggemma-300m` | Путь к модели для torch (относительно каталога репозитория) |
@@ -199,8 +207,11 @@ Exchange и очереди RabbitMQ создаются автоматическ�
 | `model.device` | `cpu` | `cpu`, `cuda` (NVIDIA и AMD ROCm) или `auto` |
 | `model.dtype` | `float32` | `float32` для CPU, `bfloat16`/`float16` для GPU |
 | `reviews.max_selected` | `8` | Сколько отзывов учитывается в векторе игры |
-| `reviews.min_chars`, `reviews.max_chars` | `150`, `600` | Минимальная длина отзыва и длина, до которой он обрезается |
-| `reviews.weight_max` | `0.35` | Вес отзывов при `max_selected` отзывах |
+| `reviews.max_chars` | `600` | Длина, до которой обрезается отзыв |
+| `reviews.weight_max` | `0.7` | Вес отзывов при `max_selected` отзывах |
+| `reviews.fusion` | `rcenter-concat` | Способ объединения описания и отзывов: `sum`, `rcenter`, `concat`, `rcenter-concat` |
+| `reviews.mean_path` | `models/fusion/review-mean-games_gemma_03b_rc07.npy` | Зафиксированный средний вектор отзывов (для `rcenter*`), пишет `ml recombine` |
+| `judge.*` | пусто | LLM-судья для `ml judge` (OpenAI-совместимый API; `api_key` — в `config.json`) |
 | `staleness.*` | см. `config.example.json` | Пороги для поиска устаревших векторов |
 | `api.host`, `api.port` | `127.0.0.1:8000` | Адрес HTTP API |
 
@@ -242,7 +253,17 @@ uv run ml import backup.npz              # создаёт коллекцию и 
 uv run ml import backup.npz --collection test --yes   # в другую коллекцию / в непустую коллекцию
 ```
 
-Файл содержит все поля, включая векторы, и не зависит от версии Milvus. Импорт проверяет модель и размерность.
+Файл содержит все поля, включая векторы и средний вектор отзывов, и не зависит от версии Milvus. Импорт проверяет модель,
+размерность и соответствие `reviews.fusion`.
+
+### Другой способ объединения векторов
+
+```bash
+uv run ml recombine --from games_gemma_03b_v1 --to games_gemma_03b_rc07   # ~5 минут, модель не нужна
+```
+
+Пересчитывает вектор поиска каждой игры по `reviews.fusion` / `reviews.weight_max` из сохранённых частей в новую коллекцию
+(исходная только читается). Для `rcenter*` при отсутствии файла `reviews.mean_path` вычисляет и сохраняет средний вектор отзывов.
 
 ### Офлайн-оценка рекомендаций
 
@@ -250,6 +271,9 @@ uv run ml import backup.npz --collection test --yes   # в другую колл
 uv run python scripts/collect_steam_users.py --seeds <профиль> --count 200   # сбор анонимизированных пользователей Steam (через списки друзей) → data/steam-users.json
 uv run ml evaluate                                          # Precision/Recall/HitRate/nDCG@K, MRR против popular и random
 uv run ml evaluate --test-selection random-liked --json report.json
+uv run ml evaluate --center --fusion sum:0.35,rcenter-concat:0.7 --json sweep.json   # сравнение способов объединения, парные CI
+uv run ml judge sweep.json --users 100 --json judged.json                           # LLM-судья (нужен judge.* в config.json)
+uv run ml evaluate --center --cf --json cf.json                                     # + коллаборативная фильтрация (EASE, item-CF) на тех же пользователях
 ```
 
 Для сбора нужны `steam.api_key` и `steam.anonymization_salt` в `config.json`. Файл импортируется в БД через backend

@@ -131,7 +131,7 @@ def _parse_run_id(message: AbstractIncomingMessage) -> int | None:
 def _evaluate_run(settings: Settings, run_id: int) -> dict:
     """Runs in a worker thread with its own DB connection and Milvus client (the vectorizer's aren't thread-safe)."""
     games = GameRepository(settings.database)
-    store = GameVectorStore(settings.milvus, settings.model)
+    store = GameVectorStore.from_settings(settings)
     try:
         run = games.get_evaluation_run(run_id)
         if run is None:
@@ -288,7 +288,7 @@ async def run_worker(settings: Settings) -> None:
     rabbit = settings.rabbitmq
     vectorizer = Vectorizer(settings)  # load the model before taking messages
     # Recommendations get their own Milvus client (the vectorizer's isn't thread-safe); the catalogue loads on first use
-    store = GameVectorStore(settings.milvus, settings.model)
+    store = GameVectorStore.from_settings(settings)
     catalogue = CatalogueCache(settings, store)
     connection = await aio_pika.connect_robust(
         host=rabbit.host,

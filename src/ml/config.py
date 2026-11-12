@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from ml.fusion import FusionKind, FusionSpec
+
 ML_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_FILE = ML_ROOT / "config.example.json"
 CONFIG_FILE = ML_ROOT / "config.json"
@@ -98,6 +100,20 @@ class ReviewSettings(BaseModel):
     max_selected: int = Field(ge=1, le=64)  # reviews embedded per game (also the Milvus array capacity limit)
     max_chars: int  # each review is cut to this many characters
     weight_max: float = Field(ge=0)  # α for a game with max_selected reviews
+    # How description and review vectors are merged (ml.fusion). A collection holds one fusion: changing it needs `ml recombine`
+    fusion: FusionKind = "sum"
+    mean_path: str = ""  # frozen mean review vector (.npy, relative to ml/), needed by the rcenter fusions
+
+    @property
+    def spec(self) -> FusionSpec:
+        return FusionSpec(self.fusion, self.weight_max)
+
+    @property
+    def mean_file(self) -> Path | None:
+        if not self.mean_path:
+            return None
+        path = Path(self.mean_path)
+        return path if path.is_absolute() else ML_ROOT / path
 
 
 class StalenessSettings(BaseModel):
@@ -120,6 +136,20 @@ class SteamSettings(BaseModel):
     min_playtime_minutes: int = 60  # a game counts as played from this playtime on
     friends_per_user: int = 10  # friends sampled from each visited user (snowball over the friend graph)
     max_depth: int = 4  # hops from the seed profiles
+
+
+class JudgeSettings(BaseModel):
+    """LLM relevance judge of `ml judge` (any OpenAI-compatible chat completions API). Only `ml judge` checks the key."""
+    base_url: str = ""  # e.g. https://host/v1 (POST {base_url}/chat/completions)
+    model: str = ""
+    api_key: str = ""  # secret: ml/config.json
+    concurrency: int = Field(default=4, ge=1, le=64)  # requests in flight
+    timeout_seconds: float = 120.0
+    max_retries: int = Field(default=6, ge=0)
+    temperature: float = 0.0
+    max_tokens: int = Field(default=1024, ge=16)  # reasoning models spend tokens before the answer
+    json_mode: bool = True  # send response_format {"type": "json_object"}; switch off if the provider rejects it
+    extra_body: dict[str, Any] = {}  # merged into the request, e.g. {"thinking": {"type": "disabled"}}
 
 
 class SearchSettings(BaseModel):
@@ -147,6 +177,7 @@ class Settings(BaseModel):
     search: SearchSettings
     api: ApiSettings
     steam: SteamSettings = SteamSettings()
+    judge: JudgeSettings = JudgeSettings()
 
 
 class ConfigError(Exception):

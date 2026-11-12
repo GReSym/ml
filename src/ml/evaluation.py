@@ -27,6 +27,7 @@ import statistics
 import time
 from collections import Counter
 from collections.abc import Callable
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -34,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.alias_generators import to_camel
 
 from ml import recommend as rec
+from ml.cf import CommunityPopular, Ease, ItemCF
 from ml.db import GameRepository, SteamUserData, SteamUserGame
 from ml.tags import TagIndex
 from ml.vectors import GameVectorStore
@@ -51,6 +53,9 @@ HYBRID_POPULAR_LOADED = 3000
 RANK_SAMPLE = 5000
 # Most recommended games listed per strategy in the report
 HUBS = 10
+# Collaborative-filtering baselines (`cf`) and the strategy they're compared with pairwise (the product with β 0.05)
+CF_STRATEGIES = ["cf-popular", "cf-item", "cf-ease"]
+CF_PAIRED_BASES = ["knn-hybrid-0.05", "popular", "cf-popular"]
 # Resamples of the paired bootstrap (dislike strategies vs their base)
 BOOTSTRAP = 2000
 
@@ -79,6 +84,8 @@ class EvaluationParams(BaseModel):
     hidden_dislikes: int = Field(default=0, ge=0, le=5)  # disliked games hidden per user (needs one more left in train)
     tags: bool = False  # tag-only strategies (loads ~3.2 M game_tags rows)
     niche_head: int = Field(default=1000, ge=1, le=POPULAR_POOL)  # the niche metrics ignore hidden games this popular
+    cf: bool = False  # collaborative-filtering baselines cf-item and cf-ease (ml.cf), trained on the users' train games
+    cf_lambda: float = Field(default=200.0, gt=0)  # EASE regularization
 
     @field_validator("ks")
     @classmethod
@@ -123,6 +130,7 @@ class EvaluationParams(BaseModel):
             *(f"knn-hybrid-{beta:g}" for beta in self.hybrid_betas),
             *(dislike_strategy(beta, mode, lam) for beta in self.dislike_betas for mode, lam in self.dislike_variants()),
             *(["tags-top", "tags", *(f"tags-hybrid-{beta:g}" for beta in self.hybrid_betas)] if self.tags else []),
+            *(CF_STRATEGIES if self.cf else []),
             "popular", "random",
         ]
 
@@ -157,6 +165,29 @@ def pick_hidden_dislikes(train: list[SteamUserGame], count: int, rng: random.Ran
     """`count` disliked train games to hide, only if at least one more stays in train (else none)."""
     disliked = sorted((g for g in train if g.recommended is False), key=lambda g: g.game_id)
     return rng.sample(disliked, count) if count and len(disliked) > count else []
+
+
+def usable_games(user: SteamUserData, params: EvaluationParams) -> list[SteamUserGame]:
+    """Reviewed games and games played at least minPlaytimeMinutes (before the vector filter)."""
+    return [g for g in user.games if g.recommended is not None or g.playtime_minutes >= params.min_playtime_minutes]
+
+
+def enough_liked(with_vector: list[SteamUserGame], params: EvaluationParams) -> bool:
+    return sum(1 for g in with_vector if g.recommended is not False) >= params.test_size + params.min_train_games
+
+
+def split_for(
+    user: SteamUserData, with_vector: list[SteamUserGame], params: EvaluationParams
+) -> tuple[list[SteamUserGame], list[SteamUserGame], list[int], random.Random]:
+    """(train, test, hidden dislike ids, the user's rng after the split). Deterministic per user and seed, so the CF pre-pass
+    and the main loop get identical splits."""
+    # The seed mixes the user id in, so results don't depend on the order or number of users
+    rng = random.Random(f"{params.seed}:{user.id}")
+    train, test = split_user(with_vector, params, rng)
+    # A separate generator, so hiding dislikes doesn't change the other random choices
+    hidden = pick_hidden_dislikes(train, params.hidden_dislikes, random.Random(f"{params.seed}:{user.id}:dislikes"))
+    hidden_ids = sorted(g.game_id for g in hidden)
+    return [g for g in train if g.game_id not in set(hidden_ids)], test, hidden_ids, rng
 
 
 def train_ratings(train: list[SteamUserGame]) -> list[rec.Rating]:
@@ -327,26 +358,35 @@ def evaluate(
     niche_percentiles: dict[str, list[float]] = {s: [] for s in percentiles}
     recommended_counts: dict[str, Counter[int]] = {s: Counter() for s in strategies}
 
+    cf_models: dict[str, CommunityPopular | ItemCF | Ease] = {}
+    cf_held_out: dict[int, set[int]] = {}  # user id → the games the CF models never saw (checked against the loop's split)
+    if params.cf:
+        # Pre-pass: every user's liked train games, split exactly like the loop below does, train one model of each kind
+        rows = []
+        for user in users:
+            usable = usable_games(user, params)
+            have = store.ids_with_vectors([g.game_id for g in usable])
+            with_vector = [g for g in usable if g.game_id in have]
+            if not enough_liked(with_vector, params):
+                continue
+            train, test, hidden_ids, _ = split_for(user, with_vector, params)
+            rows.append([g.game_id for g in train if g.recommended is not False])
+            cf_held_out[user.id] = {g.game_id for g in test} | set(hidden_ids)
+        cf_models = {"cf-popular": CommunityPopular(rows), "cf-item": ItemCF(rows), "cf-ease": Ease(rows, params.cf_lambda)}
+
     for done, user in enumerate(users, start=1):
         if progress is not None:
             progress(done, len(users))
-        # The seed mixes the user id in, so results don't depend on the order or number of users
-        rng = random.Random(f"{params.seed}:{user.id}")
-        usable = [g for g in user.games if g.recommended is not None or g.playtime_minutes >= params.min_playtime_minutes]
+        usable = usable_games(user, params)
         vectors = store.get_vectors([g.game_id for g in usable])
         with_vector = [g for g in usable if g.game_id in vectors]
         filtered["withoutVector"] += len(usable) - len(with_vector)
 
-        liked = sum(1 for g in with_vector if g.recommended is not False)
-        if liked < params.test_size + params.min_train_games:
+        if not enough_liked(with_vector, params):
             skipped["tooFewLikedGames"] += 1
             continue
 
-        train, test = split_user(with_vector, params, rng)
-        # A separate generator, so hiding dislikes doesn't change the other random choices
-        hidden = pick_hidden_dislikes(train, params.hidden_dislikes, random.Random(f"{params.seed}:{user.id}:dislikes"))
-        hidden_ids = sorted(g.game_id for g in hidden)
-        train = [g for g in train if g.game_id not in set(hidden_ids)]
+        train, test, hidden_ids, rng = split_for(user, with_vector, params)
         ratings = train_ratings(train)
         user_ids = [g.game_id for g in with_vector]
         user_vectors = dict(zip(user_ids, space(user_ids, vectors)))
@@ -472,6 +512,18 @@ def evaluate(
         if params.tags:
             add_tag_strategies(ratings, excluded, probe_ids, free, lists, probe_percentiles, probe_pop, candidates_pop)
 
+        if cf_models:
+            # The CF models were fitted before this loop: a different split here would leak hidden games into them
+            if cf_held_out.get(user.id) != set(test_ids) | set(hidden_ids):
+                raise EvaluationError(f"CF pre-pass split differs from the evaluation split for {user.name}")
+            liked_train = [g.game_id for g in train if g.recommended is not False]
+            free_sample = sample_ids[free]
+            for name, model in cf_models.items():
+                cf_scores = model.scores(liked_train)
+                lists[name] = model.data.top(cf_scores, excluded, max_k)
+                probe_percentiles[name] = rank_percentiles(model.data.lookup(cf_scores, probe_ids),
+                                                           model.data.lookup(cf_scores, free_sample))
+
         test_count = len(test_ids)
         user_percentiles = {s: values[:test_count] for s, values in probe_percentiles.items()}
         hidden_percentiles = {s: values[test_count:] for s, values in probe_percentiles.items()}
@@ -577,6 +629,20 @@ def evaluate(
                 max_k, np.random.default_rng(params.seed),
             )}
 
+    # CF baselines vs the product and vs popular, paired over every evaluated user
+    if params.cf:
+        everyone = list(range(evaluated))
+        for strategy in CF_STRATEGIES:
+            for base in CF_PAIRED_BASES:
+                if base not in ranks or base == strategy:
+                    continue
+                paired[f"{strategy} vs {base}"] = {"base": base, **paired_comparison(
+                    [ranks[base][i] for i in everyone], [ranks[strategy][i] for i in everyone],
+                    [user_mean_percentiles[base][i] for i in everyone],
+                    [user_mean_percentiles[strategy][i] for i in everyone],
+                    max_k, np.random.default_rng(params.seed),
+                )}
+
     return {
         "params": params.model_dump(by_alias=True),
         "users": {"total": len(users), "evaluated": evaluated, "skipped": dict(skipped)},
@@ -631,6 +697,28 @@ def paired_comparison(
     return result
 
 
+def _load_inputs(games: GameRepository, params: EvaluationParams) -> dict:
+    """Everything a run reads from MariaDB besides the vectors (users, catalogue ids, popularity, tags)."""
+    users = games.get_steam_users()
+    if not users:
+        raise EvaluationError("No Steam users in the database: collect and import them first (docs/evaluation.md)")
+    all_game_ids = games.get_game_ids()
+    return {
+        "users": users,
+        "popular_ids": games.get_popular_game_ids(POPULAR_POOL),
+        "all_game_ids": all_game_ids,
+        "recommendation_counts": games.get_recommendation_counts(),
+        "tag_index": TagIndex(*games.get_game_tags(), all_game_ids) if params.tags else None,
+    }
+
+
+def _add_hub_titles(report: dict, games: GameRepository) -> None:
+    titles = games.get_titles(sorted({hub["gameId"] for hubs in report["hubs"].values() for hub in hubs}))
+    for hubs in report["hubs"].values():
+        for hub in hubs:
+            hub["title"] = titles.get(hub["gameId"])
+
+
 def run_evaluation(
     params: EvaluationParams,
     store: GameVectorStore,
@@ -638,21 +726,121 @@ def run_evaluation(
     progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Loads the users and the baselines' inputs from MariaDB, then evaluates."""
-    users = games.get_steam_users()
-    if not users:
-        raise EvaluationError("No Steam users in the database: collect and import them first (docs/evaluation.md)")
-    log.info("Evaluating %d Steam users with %s", len(users), params.model_dump(by_alias=True))
-    all_game_ids = games.get_game_ids()
-    tag_index = TagIndex(*games.get_game_tags(), all_game_ids) if params.tags else None
+    inputs = _load_inputs(games, params)
+    log.info("Evaluating %d Steam users with %s", len(inputs["users"]), params.model_dump(by_alias=True))
     report = evaluate(
-        params, users, store, games.get_popular_game_ids(POPULAR_POOL), all_game_ids,
-        games.get_recommendation_counts(), progress, tag_index,
+        params, inputs["users"], store, inputs["popular_ids"], inputs["all_game_ids"],
+        inputs["recommendation_counts"], progress, inputs["tag_index"],
     )
-    titles = games.get_titles(sorted({hub["gameId"] for hubs in report["hubs"].values() for hub in hubs}))
-    for hubs in report["hubs"].values():
-        for hub in hubs:
-            hub["title"] = titles.get(hub["gameId"])
+    _add_hub_titles(report, games)
     return report
+
+
+# Strategies compared between fusion specs (those present in the reports)
+FUSION_PAIRED = ("gresym", "knn", "knn-hybrid-0.05", "knn-hybrid-0.2")
+
+
+def paired_runs(base: dict, other: dict, strategies: list[str], k: int, seed: int) -> dict:
+    """Per strategy: `other` − `base`, paired per user (matched by name) over two reports of the same users and splits."""
+    by_name = {user["name"]: user for user in base["perUser"]}
+    pairs = [(by_name[user["name"]], user) for user in other["perUser"] if user["name"] in by_name]
+    result = {}
+    for strategy in strategies:
+        if strategy not in base["strategies"] or strategy not in other["strategies"]:
+            continue
+        result[strategy] = paired_comparison(
+            [b["ranks"][strategy] for b, _ in pairs], [o["ranks"][strategy] for _, o in pairs],
+            [statistics.fmean(b["rankPercentiles"][strategy]) for b, _ in pairs],
+            [statistics.fmean(o["rankPercentiles"][strategy]) for _, o in pairs],
+            k, np.random.default_rng(seed),
+        )
+    return result
+
+
+def run_fusion_sweep(
+    params: EvaluationParams,
+    store: GameVectorStore,
+    games: GameRepository,
+    specs: list[str],
+    max_selected: int,
+    cache: Path | None = None,
+    refresh: bool = False,
+) -> dict:
+    """The same evaluation once per fusion spec (ml.memstore) on identical users and splits, + paired deltas vs the first."""
+    from ml.fusion import FusionSpec
+    from ml.memstore import GameComponents, InMemoryVectorStore
+
+    parsed = [FusionSpec.parse(spec) for spec in specs]
+    if not parsed:
+        raise EvaluationError("No fusion specs")
+    inputs = _load_inputs(games, params)
+    components = GameComponents.load(store, cache, refresh)
+    anisotropy = components.anisotropy(params.seed)
+    log.info("Mean cosine of random game pairs: %s", {k: round(v, 3) for k, v in anisotropy.items()})
+    log.info("Evaluating %d Steam users with %s", len(inputs["users"]), params.model_dump(by_alias=True))
+
+    reports: dict[str, dict] = {}
+    for spec in parsed:
+        started = time.monotonic()
+        memory = InMemoryVectorStore(components.ids, components.fuse(spec, max_selected), store.collection)
+        reports[spec.name] = evaluate(
+            params, inputs["users"], memory, inputs["popular_ids"], inputs["all_game_ids"],
+            inputs["recommendation_counts"], None, inputs["tag_index"],
+        )
+        _add_hub_titles(reports[spec.name], games)
+        del memory
+        log.info("Fusion %s done in %.0f s", spec.name, time.monotonic() - started)
+
+    reference = parsed[0].name
+    return {
+        "params": params.model_dump(by_alias=True),
+        "maxSelected": max_selected,
+        "anisotropy": anisotropy,
+        "reference": reference,
+        "fusions": reports,
+        "paired": {
+            name: paired_runs(reports[reference], report, list(FUSION_PAIRED), params.ks[-1], params.seed)
+            for name, report in reports.items() if name != reference
+        },
+    }
+
+
+def format_fusion_report(sweep: dict) -> str:
+    """Compact table of a fusion sweep: one row per spec × strategy, plus paired deltas vs the reference spec."""
+    k = sweep["params"]["ks"][-1]
+    lines = []
+    if anisotropy := sweep.get("anisotropy"):
+        lines.append("Mean cosine of random game pairs: " + ", ".join(f"{n} {v:.3f}" for n, v in anisotropy.items()))
+        lines.append("")
+    first = next(iter(sweep["fusions"].values()))
+    lines.append(f"Users evaluated: {first['users']['evaluated']}; reference: {sweep['reference']}; K = {k}")
+    lines.append(f"{'fusion':<20} {'strategy':<18} {'HR@K':>6} {'nDCG@K':>7} {'MRR':>6} {'rank pct med/mean':>17} "
+                 f"{'nicheHR':>7} {'cov':>6} {'top hub (users)':<40}")
+    for name, report in sweep["fusions"].items():
+        for strategy in FUSION_PAIRED + ("popular",):
+            summary = report["strategies"].get(strategy)
+            if summary is None or (strategy == "popular" and name != sweep["reference"]):
+                continue
+            pct = summary.get("rankPercentile") or {}
+            pct_text = f"{pct['median']:.2%}/{pct['mean']:.2%}" if pct.get("median") is not None else "–"
+            hubs = report["hubs"].get(strategy) or []
+            hub = f"{(hubs[0].get('title') or hubs[0]['gameId'])[:32]} ({hubs[0]['users']})" if hubs else "–"
+            lines.append(f"{name:<20} {strategy:<18} {summary[str(k)]['hitRate']:>6.3f} {summary[str(k)]['ndcg']:>7.4f} "
+                         f"{summary['mrr']:>6.4f} {pct_text:>17} {summary['niche'][str(k)]['hitRate']:>7.4f} "
+                         f"{summary['coverage']:>6.2%} {hub:<40}")
+        lines.append("")
+    lines.append(f"Paired vs {sweep['reference']}: Δ = fusion − reference [95 % CI]; rank percentile: lower is better")
+    lines.append(f"{'fusion':<20} {'strategy':<18} {'ΔHR@' + str(k):>24} {'ΔMRR':>24} {'Δrank pct':>26} {'won/lost':>9}")
+    for name, by_strategy in sweep["paired"].items():
+        for strategy, p in by_strategy.items():
+            if not p.get("users"):
+                continue
+            cells = [f"{p[m]['delta']:+.3f} [{p[m]['ci'][0]:+.3f}, {p[m]['ci'][1]:+.3f}]" for m in ("hitRate", "mrr")]
+            pct = p["rankPercentile"]
+            cells.append(f"{pct['delta']:+.2%} [{pct['ci'][0]:+.2%}, {pct['ci'][1]:+.2%}]")
+            lines.append(f"{name:<20} {strategy:<18} {cells[0]:>24} {cells[1]:>24} {cells[2]:>26} "
+                         f"{p['won']:>4}/{p['lost']:<4}")
+    return "\n".join(lines)
 
 
 def _hits_lines(strategies: dict, spread: Callable[[dict], dict], label: str) -> list[str]:
@@ -705,7 +893,7 @@ def format_report(report: dict) -> str:
         lines += _hits_lines(report["strategies"], lambda summary: summary["niche"]["hits"], "niche hits")
     if paired := report.get("paired"):
         first = next(iter(paired.values()))
-        lines += ["", (f"Dislike strategies vs their base, users with dislikes in train ({first.get('users', 0)}), "
+        lines += ["", ("Paired comparisons (dislike strategies: users with dislikes in train; CF: every user), "
                        "Δ = strategy − base [95 % CI]; rank percentile: lower is better"),
                   f"{'strategy':<36} {'ΔHR@' + str(first.get('k', '')):>24} {'ΔMRR':>24} {'Δrank pct':>26} {'won/lost':>9}"]
         for strategy, p in paired.items():
