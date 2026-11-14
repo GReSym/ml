@@ -22,6 +22,7 @@ class RatingDto(CamelModel):
 
 
 class RecommendationsRequest(CamelModel):
+    hide_nsfw: bool = True
     ratings: list[RatingDto] = Field(max_length=5000)
     # The user's planned / rejected games: weak likes / dislikes (±rec.LIST_WEIGHT), never recommended.
     # Ignored for games that are in `ratings` too
@@ -53,7 +54,8 @@ def scored(items: list[tuple[int, float]]) -> list[ScoredGameDto]:
     return [ScoredGameDto(game_id=game_id, score=score) for game_id, score in items]
 
 
-def recommend(store: GameVectorStore, stats: CatalogueStats, request: RecommendationsRequest) -> RecommendationsResponse:
+def recommend(store: GameVectorStore, stats: CatalogueStats, request: RecommendationsRequest,
+              exclude_ids: list[int] | None = None) -> RecommendationsResponse:
     """Blocking (Milvus searches): call it from a thread."""
     ratings = [rec.Rating(r.game_id, r.rating, r.recommend) for r in request.ratings]
     rated = {r.game_id for r in request.ratings}
@@ -66,6 +68,6 @@ def recommend(store: GameVectorStore, stats: CatalogueStats, request: Recommenda
     dislike_mode = request.dislike_mode or rec.DEFAULT_USER_DISLIKE_MODE
     dislike_strength = rec.DEFAULT_DISLIKE_STRENGTH if request.dislike_strength is None else request.dislike_strength
     result = rec.recommend(store, stats, ratings, request.limit, mainstream,
-                           dislikes=rec.dislike_params(dislike_mode, dislike_strength))
+                           exclude_ids=exclude_ids, dislikes=rec.dislike_params(dislike_mode, dislike_strength))
     return RecommendationsResponse(items=scored(result.items), used_ratings=result.used_ratings, mainstream=mainstream,
                                    dislike_mode=dislike_mode, dislike_strength=dislike_strength)

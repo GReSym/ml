@@ -20,6 +20,7 @@ from ml.search import GameSearch, SearchMode
 from ml.staleness import Reason, filter_items, find_stale
 from ml.text_index import GameTextStore
 from ml.vectors import GameVectorStore
+from ml.visibility import excluded_game_ids
 
 
 class SimilarResponse(CamelModel):
@@ -88,12 +89,14 @@ def health() -> HealthResponse:
 @app.post("/recommendations", response_model=RecommendationsResponse, response_model_by_alias=True)
 def recommendations(request: RecommendationsRequest) -> RecommendationsResponse:
     """Not used by the backend any more (it queues ml.recommend for the worker); kept for debugging."""
-    return personal.recommend(_store(), app.state.catalogue.get(), request)
+    return personal.recommend(_store(), app.state.catalogue.get(), request,
+                              excluded_game_ids(get_settings().database, request.hide_nsfw))
 
 
 @app.get("/games/{game_id}/similar", response_model=SimilarResponse, response_model_by_alias=True)
-def similar_games(game_id: int, limit: int = Query(default=10, ge=1, le=100)) -> SimilarResponse:
-    items = rec.similar(_store(), game_id, limit)
+def similar_games(game_id: int, limit: int = Query(default=10, ge=1, le=100),
+                  hide_nsfw: bool = Query(default=True, alias="hideNsfw")) -> SimilarResponse:
+    items = rec.similar(_store(), game_id, limit, excluded_game_ids(get_settings().database, hide_nsfw))
     if items is None:
         raise HTTPException(status_code=404, detail=f"Game {game_id} has no vector")
     return SimilarResponse(items=scored(items))
@@ -102,11 +105,13 @@ def similar_games(game_id: int, limit: int = Query(default=10, ge=1, le=100)) ->
 @app.get("/search", response_model=SearchResponse, response_model_by_alias=True)
 def search(
     q: str = Query(min_length=1, max_length=500),
+    hide_nsfw: bool = Query(default=True, alias="hideNsfw"),
     exact: bool = Query(default=True, description="true: keywords only (BM25); false: also by meaning (loads the model)"),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> SearchResponse:
     """Games ranked by relevance to the query (weighted RRF, see ml.search)."""
-    result = app.state.search.search(q.strip(), exact, limit)
+    result = app.state.search.search(q.strip(), exact, limit,
+                                     excluded_game_ids(get_settings().database, hide_nsfw))
     return SearchResponse(items=scored([(game_id, round(score, 6)) for game_id, score in result.items]), mode=result.mode)
 
 

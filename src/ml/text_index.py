@@ -133,13 +133,14 @@ class GameTextStore:
         )
         return {row["id"]: row["desc_hash"] for row in rows}
 
-    def search(self, query: str, limit: int) -> dict[str, list[int]]:
+    def search(self, query: str, limit: int, exclude_ids: list[int] | None = None) -> dict[str, list[int]]:
         """Ranked game ids per field (title, text), best first. A query of only stop words matches nothing."""
         result = self._client.search(
             self._collection,
             data=[query],
             anns_field=TITLE_SPARSE_FIELD,
             limit=limit,
+            filter=f"id not in {list(exclude_ids)}" if exclude_ids else "",
             search_params={"metric_type": "BM25"},
         )
         titles = [hit["id"] for hit in result[0]]
@@ -148,6 +149,7 @@ class GameTextStore:
             data=[query],
             anns_field=TEXT_SPARSE_FIELD,
             limit=limit,
+            filter=f"id not in {list(exclude_ids)}" if exclude_ids else "",
             search_params={"metric_type": "BM25"},
         )
         return {TITLE_FIELD: titles, TEXT_FIELD: [hit["id"] for hit in result[0]]}

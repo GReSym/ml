@@ -275,14 +275,14 @@ def recommend(
 
     fetched = store.get_vectors(knn_candidates(store, liked, sorted(excluded)))
     pool = list(fetched)
-    rows = [center(np.asarray([fetched[i] for i in pool], dtype=np.float32).reshape(len(pool), -1), stats.mean)]
+    rows = [center(np.asarray([fetched[i] for i in pool], dtype=np.float32).reshape(len(pool), stats.mean.size), stats.mean)]
     beta = mainstream_beta(mainstream)
     if beta > 0:
         taken = excluded | set(pool)
         extra = [(row, game_id) for row, game_id in enumerate(stats.popular_ids) if game_id not in taken]
         extra = extra[:POPULAR_CANDIDATES]
         pool += [game_id for _, game_id in extra]
-        rows.append(stats.popular_vectors[[row for row, _ in extra]].reshape(len(extra), -1))
+        rows.append(stats.popular_vectors[[row for row, _ in extra]].reshape(len(extra), stats.mean.size))
     used = len(liked) + len(disliked)
     if not pool:
         return Recommendations(items=[], used_ratings=used)
@@ -300,9 +300,11 @@ def popularity(counts: np.ndarray, max_count: int) -> np.ndarray:
     return np.log1p(counts) / np.log1p(max(max_count, 1))
 
 
-def similar(store: GameVectorStore, game_id: int, limit: int) -> list[tuple[int, float]] | None:
+def similar(store: GameVectorStore, game_id: int, limit: int, exclude_ids: list[int] | None = None) -> list[tuple[int, float]] | None:
     """Games closest to one game. None if the game has no vector."""
+    if exclude_ids and game_id in exclude_ids:
+        return None
     vector = store.get_vectors([game_id]).get(game_id)
     if vector is None:
         return None
-    return store.search(vector, limit, exclude_ids=[game_id])
+    return store.search(vector, limit, exclude_ids=sorted(set(exclude_ids or []) | {game_id}))

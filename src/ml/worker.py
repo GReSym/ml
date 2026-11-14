@@ -23,7 +23,8 @@ from pydantic import Field, ValidationError
 
 from ml import personal
 from ml.catalogue import CatalogueCache
-from ml.config import RabbitMqSettings, Settings
+from ml.config import RabbitMqSettings, Settings, get_settings
+from ml.visibility import excluded_game_ids
 from ml.db import GameRepository
 from ml.evaluation import EvaluationError, EvaluationParams, run_evaluation
 from ml.vectorize import Vectorizer
@@ -241,7 +242,8 @@ async def _handle_recommendation(message: AbstractIncomingMessage, settings: Rab
 
     try:
         # Milvus searches are blocking: off the event loop. The first call also loads the catalogue stats (~6 s)
-        result = await asyncio.to_thread(lambda: personal.recommend(store, catalogue.get(), task))
+        result = await asyncio.to_thread(lambda: personal.recommend(
+            store, catalogue.get(), task, excluded_game_ids(get_settings().database, task.hide_nsfw)))
     except Exception as e:
         # x-delivery-count = earlier failed deliveries; the broker dead-letters the message past x-delivery-limit.
         # Report one attempt early, so a message never reaches the DLQ without the API hearing about it

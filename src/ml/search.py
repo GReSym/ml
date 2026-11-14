@@ -68,13 +68,13 @@ class GameSearch:
                     self._embedder_failed = True
         return self._embedder
 
-    def search(self, query: str, exact: bool, limit: int) -> SearchResult:
+    def search(self, query: str, exact: bool, limit: int, exclude_ids: list[int] | None = None) -> SearchResult:
         """Blocking (Milvus, embedding): call it from a thread."""
         if not query.strip():
             return SearchResult(items=[], mode="bm25")
         settings = self._settings.search
         n = max(limit, settings.candidates)
-        keyword = self._texts.search(query, n)
+        keyword = self._texts.search(query, n, exclude_ids=exclude_ids)
         lists = [(keyword[TITLE_FIELD], settings.title_weight), (keyword[TEXT_FIELD], settings.text_weight)]
 
         mode: SearchMode = "bm25"
@@ -83,7 +83,7 @@ class GameSearch:
             if embedder is not None:
                 # With a concat fusion the query only meets the description half of the game vectors (ml.fusion)
                 query_vector = self._settings.reviews.spec.query(embedder.embed_query(query))
-                hits = self._vectors.search(query_vector, n, exclude_ids=[])
+                hits = self._vectors.search(query_vector, n, exclude_ids=exclude_ids or [])
                 lists.append(([game_id for game_id, _ in hits], settings.dense_weight))
                 mode = "hybrid"
 

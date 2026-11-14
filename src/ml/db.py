@@ -94,6 +94,15 @@ class GameRepository:
             self._connection.ping(reconnect=True)
         return self._connection
 
+    def get_nsfw_game_ids(self) -> list[int]:
+        """Current tag classification, deliberately independent of the catalogue statistics cache."""
+        with self._connect().cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT gt.game_id FROM game_tags gt "
+                "JOIN tags t ON t.id = gt.tag_id WHERE t.nsfw = TRUE"
+            )
+            return [row["game_id"] for row in cursor.fetchall()]
+
     def get_games(self, ids: list[int]) -> list[GameText]:
         if not ids:
             return []
